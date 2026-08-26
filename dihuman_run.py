@@ -225,7 +225,6 @@ class DiHumanProcessor:
 
         full_body_img_dir, lms_dir = _resolve_asset_dirs(data_path)
         self.full_body_img_list, self.bbox_list = self._load_assets(full_body_img_dir, lms_dir, max_frames)
-        self.silent_idle_img_list: List[Optional[np.ndarray]] = [None] * len(self.full_body_img_list)
         self.frame_picker = _BounceIndex(len(self.bbox_list))
 
         unet_path = _resolve_default_path(unet_onnx, data_path, "unet.onnx")
@@ -370,16 +369,7 @@ class DiHumanProcessor:
         return None, 0
 
     def _next_silent_idle_img(self) -> Tuple[Optional[np.ndarray], int]:
-        img, check_img = self._next_idle_img()
-        if not check_img or img is None:
-            return img, check_img
-
-        cached = self.silent_idle_img_list[self.last_frame_index]
-        if cached is None:
-            bbox = self.bbox_list[self.last_frame_index]
-            cached = self._run_idle_unet(img, bbox)
-            self.silent_idle_img_list[self.last_frame_index] = cached.copy()
-        return cached.copy(), check_img
+        return self._next_idle_img()
 
     def warm_up(self, chunks: int = 80) -> None:
         picker_index = self.frame_picker.index

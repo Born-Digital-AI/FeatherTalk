@@ -35,7 +35,7 @@ FEATHER_HUBERT_CHECKPOINT = (
 FEATHER_HUBERT_ONNX = ROOT_DIR / "assets" / "featherhubert" / "feather_hubert.onnx"
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav"}
 REALTIME_VOICE_WS_URL = "wss://internal-test.borndigital.ai/realtime-voice-control/ws"
-STREAM_MAX_FRAMES = 180
+STREAM_MAX_FRAMES = 500
 PLAYBACK_CHUNK_FRAMES = 4
 
 
