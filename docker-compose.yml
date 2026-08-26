@@ -1,0 +1,23 @@
+services:
+  feathertalk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: feathertalk:cuda13
+    ports:
+      - "8000:8000"
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities:
+          - gpu
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./audio:/app/audio
+      - ./checkpoints:/app/checkpoints
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    restart: unless-stopped

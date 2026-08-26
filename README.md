@@ -279,6 +279,35 @@ unzip assets/feathertalk_assets.zip -d assets/featherhubert
 mv assets/featherhubert/kanghui_training_video_featherhubert_188_latest/* assets/featherhubert
 ```
 
+## Docker Compose
+
+The Docker image follows the CUDA 13.0 installation flow above without creating a conda
+environment. It installs the CUDA 13.0 PyTorch wheels, installs `requirements.txt`, including
+the CUDA/cuDNN runtime libraries needed by ONNX Runtime, downloads the FeatherTalk assets during
+the image build, and starts the FastAPI app from `app.py`.
+
+Run the app with:
+
+```bash
+docker compose up --build
+```
+
+The GUI is served at:
+
+```text
+http://localhost:8000/
+```
+
+The Compose service mounts these host folders into the container so trained avatars and
+generated files can be reused without rebuilding the image:
+
+```text
+./audio       -> /app/audio
+./checkpoints -> /app/checkpoints
+./data        -> /app/data
+./outputs     -> /app/outputs
+```
+
 ## Required Weights / 必需权重
 
 The lightweight preprocessing models are included in this source release:

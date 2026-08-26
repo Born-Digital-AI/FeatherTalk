@@ -756,11 +756,12 @@ def ensure_streaming_unet(avatar: str) -> Path:
 
 def preload_onnxruntime_cuda() -> None:
     try:
-        import torch  # noqa: F401
         import onnxruntime
     except ImportError:
         return
     if hasattr(onnxruntime, "preload_dlls"):
+        with contextlib.suppress(Exception):
+            onnxruntime.preload_dlls(directory="")
         with contextlib.suppress(Exception):
             onnxruntime.preload_dlls(directory=None)
 
