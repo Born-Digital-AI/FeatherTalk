@@ -252,6 +252,33 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 预处理和音视频合并需要安装 `ffmpeg`。
 
+## Installation steps for cuda 13.0
+
+Python 3.10 is recommended.
+
+```bash
+conda create -n feathertalk python=3.10 -y
+conda activate feathertalk
+
+pip install \
+  torch==2.11.0 \
+  torchvision==0.26.0 \
+  torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+  
+pip install -r requirements.txt
+
+pip install gdown
+mkdir -p assets
+
+gdown 1-gSAp_BlQ7xPBDQRCf9cjaYjQT03IOxI \
+  -O assets/feathertalk_assets.zip
+  
+mkdir -p assets/featherhubert
+unzip assets/feathertalk_assets.zip -d assets/featherhubert
+mv assets/featherhubert/kanghui_training_video_featherhubert_188_latest/* assets/featherhubert
+```
+
 ## Required Weights / 必需权重
 
 The lightweight preprocessing models are included in this source release:

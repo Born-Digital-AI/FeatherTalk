@@ -16,6 +16,7 @@ venv/
 .vscode/
 
 # Data and generated media
+data/
 data_dir/
 dataset/
 datasets/
