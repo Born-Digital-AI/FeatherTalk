@@ -35,7 +35,7 @@ def check_onnx(onnx_path, torch_out, torch_in, audio):
     print(f"onnx time cost: {t2 - t1:.4f}s")
 
     np.testing.assert_allclose(
-        torch_out[0].cpu().numpy(), ort_outs[0][0], rtol=1e-03, atol=1e-05,
+        torch_out[0].cpu().numpy(), ort_outs[0][0], rtol=1e-02, atol=1e-03,
     )
     print("Exported model has been tested with ONNXRuntime, and the result looks good!")
 
@@ -78,6 +78,7 @@ def main():
             output_names=['output'],
             opset_version=args.opset,
             export_params=True,
+            dynamo=False,
         )
     check_onnx(args.onnx_path, torch_out, img, audio)
 

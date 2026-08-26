@@ -24,6 +24,15 @@ from typing import Any, Callable, List, Optional, Tuple
 import cv2
 import numpy as np
 import onnxruntime
+from face_utils import (
+    FACE_BORDER,
+    FACE_INNER_SIZE,
+    compute_face_bbox,
+    crop_face,
+    extract_inner,
+    mask_mouth,
+    read_landmarks,
+)
 
 try:
     import kaldi_native_fbank as knf
@@ -58,6 +67,8 @@ PLAY_PRE_PAD = 13440
 FEATHER_TOKENS_PER_VIDEO_FRAME = 2
 FEATHER_DEFAULT_OUTPUT_DIM = 1024
 FEATHER_RIGHT_CONTEXT_FRAMES = 4
+FEATHER_STREAM_WINDOW_SAMPLES = 720
+FEATHER_STREAM_HOP_SAMPLES = 640
 
 SILENCE_THRESHOLD = 100
 UNET_FEAT_WINDOW = 8
@@ -125,24 +136,13 @@ def _ort_providers(force_cpu: bool = False) -> List[str]:
 
 
 def _read_landmarks_to_bbox(lms_path: str) -> Tuple[int, int, int, int]:
-    pts = []
-    with open(lms_path, "r") as f:
-        for line in f.read().splitlines():
-            line = line.strip()
-            if line:
-                pts.append(np.fromstring(line, sep=" ", dtype=np.float32))
-    lms = np.array(pts, dtype=np.int32)
-    xmin = int(lms[1][0])
-    ymin = int(lms[52][1])
-    xmax = int(lms[31][0])
-    ymax = ymin + (xmax - xmin)
-    return xmin, ymin, xmax, ymax
+    return compute_face_bbox(read_landmarks(lms_path))
 
 
 def _build_unet_inputs(crop_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     crop_ori = crop_img.copy()
-    inner = crop_img[4:164, 4:164].copy()
-    masked = cv2.rectangle(inner.copy(), (5, 5), (150, 145), (0, 0, 0), -1)
+    inner = extract_inner(crop_img)
+    masked = mask_mouth(inner.copy())
 
     masked = masked.transpose(2, 0, 1).astype(np.float32) / 255.0
     inner = inner.transpose(2, 0, 1).astype(np.float32) / 255.0
@@ -215,6 +215,7 @@ class DiHumanProcessor:
         feather_hubert_checkpoint: str = "",
         feather_right_context_frames: int = FEATHER_RIGHT_CONTEXT_FRAMES,
         force_cpu_onnx: bool = False,
+        max_frames: Optional[int] = None,
     ):
         self.data_path = data_path
         self.asr = _normalize_asr(asr)
@@ -223,7 +224,8 @@ class DiHumanProcessor:
         self.feather_right_context_frames = max(0, int(feather_right_context_frames))
 
         full_body_img_dir, lms_dir = _resolve_asset_dirs(data_path)
-        self.full_body_img_list, self.bbox_list = self._load_assets(full_body_img_dir, lms_dir)
+        self.full_body_img_list, self.bbox_list = self._load_assets(full_body_img_dir, lms_dir, max_frames)
+        self.silent_idle_img_list: List[Optional[np.ndarray]] = [None] * len(self.full_body_img_list)
         self.frame_picker = _BounceIndex(len(self.bbox_list))
 
         unet_path = _resolve_default_path(unet_onnx, data_path, "unet.onnx")
@@ -249,9 +251,15 @@ class DiHumanProcessor:
         self.empty_audio_counter = 56
         self.is_processing = False
         self.silence = True
+        self.last_frame_index = 0
         self._reset_audio_state()
 
-    def _load_assets(self, img_dir: str, lms_dir: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+    def _load_assets(
+        self,
+        img_dir: str,
+        lms_dir: str,
+        max_frames: Optional[int] = None,
+    ) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
         img_paths = _sorted_files(img_dir, ".jpg")
         if not img_paths:
             img_paths = _sorted_files(img_dir, ".png")
@@ -263,6 +271,8 @@ class DiHumanProcessor:
 
         # The legacy preprocessing often leaves the final landmark frame less reliable.
         n_frames = n_available - 1 if n_available > 2 else n_available
+        if max_frames is not None:
+            n_frames = min(n_frames, max(2, int(max_frames)))
         images: List[np.ndarray] = []
         boxes: List[Tuple[int, int, int, int]] = []
         for img_path, lms_path in zip(img_paths[:n_frames], lms_paths[:n_frames]):
@@ -329,6 +339,7 @@ class DiHumanProcessor:
             self.using_feat = np.zeros([USING_FEAT_INIT, 2, self.feather_output_dim], dtype=np.float32)
             self.feather_audio_buffer = np.zeros([0], dtype=np.float32)
             self.feather_emitted_frames = 0
+            self.feather_next_window_start = 0
             self.pending_feature_frames = 0
 
     def reset(self):
@@ -348,7 +359,8 @@ class DiHumanProcessor:
 
     def _next_idle_img(self) -> Tuple[Optional[np.ndarray], int]:
         if self.counter == 0:
-            img = self.full_body_img_list[self.frame_picker.index].copy()
+            self.last_frame_index = self.frame_picker.index
+            img = self.full_body_img_list[self.last_frame_index].copy()
             self.frame_picker.advance()
             self.counter = 1
             return img, 1
@@ -356,6 +368,35 @@ class DiHumanProcessor:
         if self.counter == self.idle_loop:
             self.counter = 0
         return None, 0
+
+    def _next_silent_idle_img(self) -> Tuple[Optional[np.ndarray], int]:
+        img, check_img = self._next_idle_img()
+        if not check_img or img is None:
+            return img, check_img
+
+        cached = self.silent_idle_img_list[self.last_frame_index]
+        if cached is None:
+            bbox = self.bbox_list[self.last_frame_index]
+            cached = self._run_idle_unet(img, bbox)
+            self.silent_idle_img_list[self.last_frame_index] = cached.copy()
+        return cached.copy(), check_img
+
+    def warm_up(self, chunks: int = 80) -> None:
+        picker_index = self.frame_picker.index
+        picker_step = self.frame_picker.step
+        for i in range(max(1, chunks)):
+            t = np.arange(FRAME_LEN) + i * FRAME_LEN
+            audio_frame = (np.sin(2 * np.pi * 440 * t / SAMPLE_RATE) * 12000).astype(np.int16)
+            self.process(audio_frame)
+
+        self._reset_audio_state()
+        self.counter = 0
+        self.empty_audio_counter = SILENCE_THRESHOLD
+        self.is_processing = False
+        self.silence = True
+        self.last_frame_index = picker_index
+        self.frame_picker.index = picker_index
+        self.frame_picker.step = picker_step
 
     def _pop_play_audio(self) -> np.ndarray:
         if self.audio_play_list:
@@ -392,27 +433,44 @@ class DiHumanProcessor:
 
             self._feather_expected_frames = expected_hubert_frames
 
+        if self.ort_ae is not None:
+            features = []
+            input_name = self.ort_ae.get_inputs()[0].name
+            normalized_buffer = self.feather_audio_buffer.astype(np.float32)
+            if normalized_buffer.shape[0] > 0:
+                normalized_buffer = (
+                    normalized_buffer - normalized_buffer.mean()
+                ) / np.sqrt(normalized_buffer.var() + 1e-7)
+            while self.feather_audio_buffer.shape[0] >= self.feather_next_window_start + FEATHER_STREAM_WINDOW_SAMPLES:
+                start = self.feather_next_window_start
+                end = start + FEATHER_STREAM_WINDOW_SAMPLES
+                speech = normalized_buffer[start:end]
+                hidden = self.ort_ae.run(None, {input_name: speech[None, :]})[0][0].astype(np.float32)
+                if hidden.shape[0] >= FEATHER_TOKENS_PER_VIDEO_FRAME:
+                    features.append(hidden[:FEATHER_TOKENS_PER_VIDEO_FRAME])
+                self.feather_next_window_start += FEATHER_STREAM_HOP_SAMPLES
+
+            if self.feather_next_window_start >= SAMPLE_RATE:
+                trim = self.feather_next_window_start
+                self.feather_audio_buffer = self.feather_audio_buffer[trim:]
+                self.feather_next_window_start = 0
+
+            if not features:
+                return np.empty((0, 2, self.feather_output_dim), dtype=np.float32)
+            return np.stack(features, axis=0).astype(np.float32)
+
         expected_tokens = self._feather_expected_frames(int(self.feather_audio_buffer.shape[0]))
         expected_video_frames = expected_tokens // FEATHER_TOKENS_PER_VIDEO_FRAME
         if expected_video_frames <= self.feather_emitted_frames:
             return np.empty((0, 2, self.feather_output_dim), dtype=np.float32)
 
-        if self.ort_ae is not None:
-            speech = self.feather_audio_buffer.astype(np.float32)
-            speech = (speech - speech.mean()) / np.sqrt(speech.var() + 1e-7)
-            encoder_input = speech[None, :]
-            input_name = self.ort_ae.get_inputs()[0].name
-            hidden = self.ort_ae.run(None, {input_name: encoder_input})[0][0].astype(np.float32)
-            if hidden.shape[0] % 2 == 1:
-                hidden = hidden[:-1]
-        else:
-            if self.feather_model is None or self._torch is None:
-                raise RuntimeError("FeatherHuBERT checkpoint model is not initialized.")
-            speech = self._feather_normalize(self.feather_audio_buffer)
-            with self._torch.no_grad():
-                tensor = self._torch.from_numpy(speech).to(self.feather_device)[None]
-                hidden_tensor = self.feather_model(tensor)[0].detach().cpu()
-                hidden = self._feather_make_even(hidden_tensor).numpy().astype(np.float32)
+        if self.feather_model is None or self._torch is None:
+            raise RuntimeError("FeatherHuBERT checkpoint model is not initialized.")
+        speech = self._feather_normalize(self.feather_audio_buffer)
+        with self._torch.no_grad():
+            tensor = self._torch.from_numpy(speech).to(self.feather_device)[None]
+            hidden_tensor = self.feather_model(tensor)[0].detach().cpu()
+            hidden = self._feather_make_even(hidden_tensor).numpy().astype(np.float32)
 
         if hidden.shape[0] < FEATHER_TOKENS_PER_VIDEO_FRAME:
             return np.empty((0, 2, self.feather_output_dim), dtype=np.float32)
@@ -431,11 +489,21 @@ class DiHumanProcessor:
             return self.using_feat.reshape(1, 128, 16, 32)
         return self.using_feat.reshape(1, 16, 32, 32)
 
+    def _run_idle_unet(self, img: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
+        old_using_feat = self.using_feat
+        if self.asr == ASR_WENET:
+            self.using_feat = np.zeros([UNET_FEAT_WINDOW, 16, 512], dtype=np.float32)
+        else:
+            self.using_feat = np.zeros([UNET_FEAT_WINDOW, 2, self.feather_output_dim], dtype=np.float32)
+        try:
+            return self._run_unet(img, bbox)
+        finally:
+            self.using_feat = old_using_feat
+
     def _run_unet(self, img: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
         xmin, ymin, xmax, ymax = bbox
-        crop_img = img[ymin:ymax, xmin:xmax]
-        h, w = crop_img.shape[:2]
-        crop_img = cv2.resize(crop_img, (168, 168))
+        crop_h, crop_w = img[ymin:ymax, xmin:xmax].shape[:2]
+        crop_img = crop_face(img, bbox)
         onnx_in, crop_ori = _build_unet_inputs(crop_img)
 
         audio_feat = self._audio_feat_for_unet()
@@ -446,8 +514,9 @@ class DiHumanProcessor:
         outs = self.ort_unet.run(None, inputs)
         pred = (outs[0][0].transpose(1, 2, 0) * 255).astype(np.uint8)
 
-        crop_ori[4:164, 4:164] = pred
-        crop_ori = cv2.resize(crop_ori, (w, h))
+        b = FACE_BORDER
+        crop_ori[b:b + FACE_INNER_SIZE, b:b + FACE_INNER_SIZE] = pred
+        crop_ori = cv2.resize(crop_ori, (crop_w, crop_h))
         img[ymin:ymax, xmin:xmax] = crop_ori
         return img
 
@@ -505,7 +574,7 @@ class DiHumanProcessor:
             if self.is_processing:
                 self._reset_audio_state()
             self.is_processing = False
-            return_img, check_img = self._next_idle_img()
+            return_img, check_img = self._next_silent_idle_img()
             return return_img, np.zeros([FRAME_LEN], dtype=np.int16), check_img
 
         if not self.is_processing:
