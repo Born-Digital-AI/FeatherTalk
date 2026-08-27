@@ -271,7 +271,7 @@ INDEX_HTML = """
             Phone number
             <input id="phoneNumber" name="phoneNumber" type="tel" autocomplete="tel" placeholder="+420...">
           </label>
-          <button id="startStream" type="button">Start streaming</button>
+          <button id="startStream" type="button" disabled>Start streaming</button>
           <button id="stopStream" type="button" disabled>Stop stream</button>
           <button id="startConversation" type="button" disabled>Start conversation</button>
           <button id="stopConversation" type="button" disabled>Stop conversation</button>
@@ -372,6 +372,16 @@ INDEX_HTML = """
       stageLoader.classList.remove("active");
     }
 
+    function hasPhoneNumber() {
+      return phoneNumber.value.trim().length > 0;
+    }
+
+    function updateRealtimeButtons() {
+      const phoneNumberFilled = hasPhoneNumber();
+      startStream.disabled = !phoneNumberFilled || !!streamWs;
+      startConversation.disabled = !phoneNumberFilled || !streamWs || !!conversationWs;
+    }
+
     async function loadAvatars() {
       const response = await fetch("/api/avatars");
       const data = await response.json();
@@ -429,10 +439,10 @@ INDEX_HTML = """
       showStageLoader("Preparing avatar stream...");
       setStreamStatus("Starting avatar stream...");
       streamWs = new WebSocket(wsUrl(`/ws/stream?avatar=${encodeURIComponent(streamAvatar.value)}`));
+      updateRealtimeButtons();
       streamWs.addEventListener("open", () => {
-        startStream.disabled = true;
+        updateRealtimeButtons();
         stopStream.disabled = false;
-        startConversation.disabled = false;
         setStreamStatus("Streaming idle avatar.");
       });
       streamWs.addEventListener("message", (event) => {
@@ -453,9 +463,8 @@ INDEX_HTML = """
       });
       streamWs.addEventListener("close", () => {
         streamWs = null;
-        startStream.disabled = false;
+        updateRealtimeButtons();
         stopStream.disabled = true;
-        startConversation.disabled = true;
         stopConversation.disabled = true;
         hideStageLoader();
         setStreamStatus("Stream stopped.");
@@ -519,8 +528,13 @@ INDEX_HTML = """
         setStreamStatus("Start streaming before starting a conversation.");
         return;
       }
+      if (!hasPhoneNumber()) {
+        updateRealtimeButtons();
+        return;
+      }
       setStreamStatus("Connecting realtime voice...");
       conversationWs = new WebSocket(wsUrl("/ws/conversation"));
+      updateRealtimeButtons();
       conversationWs.addEventListener("open", async () => {
         conversationWs.send(JSON.stringify({
           type: "start",
@@ -529,7 +543,7 @@ INDEX_HTML = """
           conversation_id: `feathertalk-${Date.now()}`
         }));
         await startMicrophone();
-        startConversation.disabled = true;
+        updateRealtimeButtons();
         stopConversation.disabled = false;
         setStreamStatus("Conversation started.");
       });
@@ -541,7 +555,7 @@ INDEX_HTML = """
       conversationWs.addEventListener("close", () => {
         stopMicrophone();
         conversationWs = null;
-        startConversation.disabled = !streamWs;
+        updateRealtimeButtons();
         stopConversation.disabled = true;
         setStreamStatus(streamWs ? "Conversation stopped. Idle streaming continues." : "Conversation stopped.");
       });
@@ -554,6 +568,8 @@ INDEX_HTML = """
         conversationWs.close();
       }
     });
+
+    phoneNumber.addEventListener("input", updateRealtimeButtons);
 
     audio.addEventListener("change", async () => {
       generate.disabled = true;
