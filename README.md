@@ -222,6 +222,7 @@ Recommended / 建议：
 - 声音要清晰，尽量避免噪声、回声和明显房间混响。
 - Use an external microphone if possible.
 - 条件允许的话，建议使用外接麦克风。
+- Start the training video with at least 20 seconds of silence and only small, natural head movement.
 - Use 25 fps video for HuBERT or FeatherHuBERT features.
 - HuBERT 和 FeatherHuBERT 路线建议使用 25fps 视频。
 - Use 20 fps video for Wenet features.
@@ -387,6 +388,29 @@ cd ..
 
 HuBERT and FeatherHuBERT use the `hubert` feature shape in this project, so they use the
 25fps path. Wenet uses 20fps.
+
+## Avatar Training
+
+For the default avatar workflow, place the training video at:
+
+```text
+data/<avatar_name>/train.mp4
+```
+
+The video must be 25 FPS. The first 20 seconds should contain silence with only small,
+natural movement. The rest of the video should mostly contain speech, ideally with short
+pauses between sentences.
+
+Run preprocessing and training with:
+
+```bash
+./scripts/train_avatar.sh <avatar_name>
+```
+
+The script runs FeatherHuBERT preprocessing, trains with `train_mouth_roi_temporal_loss.py`,
+writes checkpoints to `checkpoints/<avatar_name>`, writes preview frames to
+`outputs/train_preview`, and removes intermediate `.pth` checkpoints after training while
+keeping `last.pth`.
 
 HuBERT 和 FeatherHuBERT 在本项目中使用同一种 `hubert` 特征形状，因此走 25fps 路线。Wenet 走 20fps 路线。
 
