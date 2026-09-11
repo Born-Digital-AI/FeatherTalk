@@ -407,7 +407,7 @@ Run preprocessing and training with:
 ./scripts/train_avatar.sh <avatar_name>
 ```
 
-The script runs FeatherHuBERT preprocessing, trains with `train_mouth_roi_temporal_loss.py`,
+The script runs FeatherHuBERT preprocessing, trains with `train.py`,
 writes checkpoints to `checkpoints/<avatar_name>`, writes preview frames to
 `outputs/train_preview`, and removes intermediate `.pth` checkpoints after training while
 keeping `last.pth`.

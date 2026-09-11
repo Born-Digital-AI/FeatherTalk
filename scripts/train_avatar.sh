@@ -29,8 +29,8 @@ echo "[2/4] Preparing output directories"
 mkdir -p "$checkpoint_dir"
 mkdir -p "$preview_dir"
 
-echo "[3/4] Training avatar: ${avatar_name}"
-python train_mouth_roi_temporal_loss.py \
+echo "[3/4] Training avatar with default training: ${avatar_name}"
+python train.py \
   --dataset_dir "$dataset_dir" \
   --save_dir "$checkpoint_dir" \
   --asr hubert \
