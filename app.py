@@ -8,8 +8,9 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
-from collections import deque
 import wave
 from pathlib import Path
 from typing import Any
@@ -35,8 +36,9 @@ FEATHER_HUBERT_CHECKPOINT = (
 FEATHER_HUBERT_ONNX = ROOT_DIR / "assets" / "featherhubert" / "feather_hubert.onnx"
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav"}
 REALTIME_VOICE_WS_URL = "wss://internal-test.borndigital.ai/realtime-voice-control/ws"
-STREAM_MAX_FRAMES = 500
 PLAYBACK_CHUNK_FRAMES = 4
+STREAM_FPS = SAMPLE_RATE / (FRAME_LEN * PLAYBACK_CHUNK_FRAMES)
+AUDIO_TAIL_TIMEOUT = 0.12
 
 
 INDEX_HTML = """
@@ -204,6 +206,19 @@ INDEX_HTML = """
     .stage-loader.active {
       display: grid;
     }
+    .stage-error {
+      display: none;
+      position: absolute;
+      inset: 0;
+      place-items: center;
+      padding: 32px;
+      background: rgba(5, 6, 8, 0.94);
+      z-index: 3;
+    }
+    .stage-error.active { display: grid; }
+    .stage-error-content { max-width: 560px; text-align: center; }
+    .stage-error h2 { color: #f0aaa5; }
+    .stage-error p { line-height: 1.6; overflow-wrap: anywhere; }
     .loader-content {
       display: grid;
       justify-items: center;
@@ -303,6 +318,12 @@ INDEX_HTML = """
       <div class="stage-inner">
         <img id="streamImage" alt="Realtime avatar stream">
         <video id="video" controls></video>
+        <div id="stageError" class="stage-error" role="alert">
+          <div class="stage-error-content">
+            <h2>Realtime streaming cannot start</h2>
+            <p id="stageErrorText"></p>
+          </div>
+        </div>
         <div id="stageLoader" class="stage-loader" aria-live="polite" aria-busy="true">
           <div class="loader-content">
             <div class="loader-spinner"></div>
@@ -322,8 +343,12 @@ INDEX_HTML = """
         if (tab.dataset.panel === "realtimePanel") {
           video.style.display = "none";
           if (streamWs) streamImage.style.display = "block";
+          if (streamFailed) stageError.classList.add("active");
         }
-        if (tab.dataset.panel === "offlinePanel") streamImage.style.display = "none";
+        if (tab.dataset.panel === "offlinePanel") {
+          streamImage.style.display = "none";
+          stageError.classList.remove("active");
+        }
       });
     });
 
@@ -343,9 +368,13 @@ INDEX_HTML = """
     const streamImage = document.querySelector("#streamImage");
     const stageLoader = document.querySelector("#stageLoader");
     const stageLoaderText = document.querySelector("#stageLoaderText");
+    const stageError = document.querySelector("#stageError");
+    const stageErrorText = document.querySelector("#stageErrorText");
 
     let uploadedAudioPath = null;
     let streamWs = null;
+    let streamReady = false;
+    let streamFailed = false;
     let conversationWs = null;
     let mediaStream = null;
     let audioContext = null;
@@ -354,6 +383,9 @@ INDEX_HTML = """
     let audioPlayerContext = null;
     let nextPlayTime = 0;
     const playbackLeadSeconds = 0.25;
+    const frameTimers = new Set();
+    let currentFrame = null;
+    let currentDirection = 1;
 
     function setStatus(value) {
       statusBox.value = value;
@@ -372,6 +404,26 @@ INDEX_HTML = """
       stageLoader.classList.remove("active");
     }
 
+    function showStreamError(value) {
+      streamFailed = true;
+      streamReady = false;
+      hideStageLoader();
+      stageErrorText.textContent = value;
+      stageError.classList.add("active");
+      setStreamStatus(value);
+      updateRealtimeButtons();
+    }
+
+    function clearPlayback() {
+      for (const timer of frameTimers) clearTimeout(timer);
+      frameTimers.clear();
+      if (audioPlayerContext) {
+        audioPlayerContext.close();
+        audioPlayerContext = null;
+      }
+      nextPlayTime = 0;
+    }
+
     function hasPhoneNumber() {
       return phoneNumber.value.trim().length > 0;
     }
@@ -379,7 +431,7 @@ INDEX_HTML = """
     function updateRealtimeButtons() {
       const phoneNumberFilled = hasPhoneNumber();
       startStream.disabled = !phoneNumberFilled || !!streamWs;
-      startConversation.disabled = !phoneNumberFilled || !streamWs || !!conversationWs;
+      startConversation.disabled = !phoneNumberFilled || !streamReady || !!conversationWs;
     }
 
     async function loadAvatars() {
@@ -412,7 +464,7 @@ INDEX_HTML = """
       return new Int16Array(bytes.buffer);
     }
 
-    function playPcm16(base64Audio) {
+    function playPcm16(base64Audio, startTime) {
       const pcm = base64ToInt16(base64Audio);
       if (!pcm.length) return;
       audioPlayerContext = audioPlayerContext || new AudioContext({ sampleRate: 16000 });
@@ -424,13 +476,43 @@ INDEX_HTML = """
       source.buffer = buffer;
       source.connect(audioPlayerContext.destination);
       const now = audioPlayerContext.currentTime;
-      nextPlayTime = Math.max(nextPlayTime, now + playbackLeadSeconds);
-      source.start(nextPlayTime);
-      nextPlayTime += buffer.duration;
+      const playTime = startTime ?? Math.max(nextPlayTime, now + playbackLeadSeconds);
+      source.start(playTime);
+      if (startTime === undefined) nextPlayTime = playTime + buffer.duration;
+    }
+
+    function playStreamPacket(message) {
+      if (!audioPlayerContext) return;
+      const context = audioPlayerContext;
+      // One timeline for both modes: queued video changes at its audio start time.
+      const playTime = nextPlayTime > context.currentTime
+        ? nextPlayTime
+        : context.currentTime + playbackLeadSeconds;
+      nextPlayTime = playTime + message.duration;
+      if (message.audio) playPcm16(message.audio, playTime);
+      const image = new Image();
+      image.src = message.image;
+      const timer = setTimeout(() => {
+        frameTimers.delete(timer);
+        streamImage.src = image.src;
+        currentFrame = message.frame_index;
+        currentDirection = message.direction;
+        streamImage.dataset.frame = String(currentFrame);
+        streamImage.dataset.direction = String(currentDirection);
+        if (document.querySelector("#realtimePanel").classList.contains("active")) {
+          streamImage.style.display = "block";
+        }
+        hideStageLoader();
+      }, Math.max(0, (playTime - context.currentTime) * 1000));
+      frameTimers.add(timer);
     }
 
     startStream.addEventListener("click", () => {
       if (streamWs) return;
+      clearPlayback();
+      streamReady = false;
+      streamFailed = false;
+      stageError.classList.remove("active");
       audioPlayerContext = audioPlayerContext || new AudioContext({ sampleRate: 16000 });
       if (audioPlayerContext.state === "suspended") audioPlayerContext.resume();
       nextPlayTime = audioPlayerContext.currentTime;
@@ -448,26 +530,32 @@ INDEX_HTML = """
       streamWs.addEventListener("message", (event) => {
         const message = JSON.parse(event.data);
         if (message.type === "frame") {
-          streamImage.src = message.image;
-          streamImage.style.display = "block";
-          hideStageLoader();
-          if (message.audio) playPcm16(message.audio);
+          playStreamPacket(message);
         } else if (message.type === "audio") {
           playPcm16(message.audio);
         } else if (message.type === "status") {
+          if (message.ready) {
+            streamReady = true;
+            updateRealtimeButtons();
+          }
           setStreamStatus(message.message);
         } else if (message.type === "error") {
-          hideStageLoader();
-          setStreamStatus(message.message);
+          showStreamError(message.message);
         }
+      });
+      streamWs.addEventListener("error", () => {
+        showStreamError("Cannot connect to the avatar stream. Check the server and try again.");
       });
       streamWs.addEventListener("close", () => {
         streamWs = null;
+        streamReady = false;
+        clearPlayback();
+        if (conversationWs) stopConversation.click();
         updateRealtimeButtons();
         stopStream.disabled = true;
         stopConversation.disabled = true;
         hideStageLoader();
-        setStreamStatus("Stream stopped.");
+        if (!streamFailed) setStreamStatus("Stream stopped.");
       });
     });
 
@@ -557,7 +645,9 @@ INDEX_HTML = """
         conversationWs = null;
         updateRealtimeButtons();
         stopConversation.disabled = true;
-        setStreamStatus(streamWs ? "Conversation stopped. Idle streaming continues." : "Conversation stopped.");
+        if (!streamFailed) {
+          setStreamStatus(streamWs ? "Conversation stopped. Idle streaming continues." : "Conversation stopped.");
+        }
       });
     });
 
@@ -955,18 +1045,58 @@ def _find_audio_payload(value: Any) -> bytes:
 
 class AvatarStream:
     def __init__(self, avatar: str):
+        self.avatar = avatar
+        silence_path = DATA_DIR / avatar / "silence.mp4"
+        if not silence_path.is_file():
+            raise FileNotFoundError(
+                f"Upload a silent avatar clip to {_relative(silence_path)} before starting realtime streaming. "
+                "Use the same frames, order and 25 FPS as the avatar training video."
+            )
+        # Cache JPEGs at display resolution; idle playback needs no model or decoding.
+        self.silent_frames: list[str] = []
+        capture = cv2.VideoCapture(str(silence_path))
+        try:
+            if not capture.isOpened():
+                raise ValueError(f"Cannot read {_relative(silence_path)}. Upload a valid MP4 clip.")
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            if not np.isclose(fps, STREAM_FPS, atol=0.01):
+                raise ValueError(f"silence.mp4 must use {STREAM_FPS:g} FPS, got {fps:g}. Upload a matching clip.")
+            self.silence_size = None
+            while True:
+                ok, image = capture.read()
+                if not ok:
+                    break
+                self.silence_size = image.shape[:2]
+                self.silent_frames.append(_jpeg_data_url(image))
+        finally:
+            capture.release()
+        if len(self.silent_frames) < 2:
+            raise ValueError(f"{_relative(silence_path)} has no usable loop. Upload a clip with at least two frames.")
+
         preload_onnxruntime_cuda()
         ensure_streaming_unet(avatar)
         feather_hubert_onnx = ensure_feather_hubert_onnx()
-        self.avatar = avatar
         self.processor = DiHumanProcessor(
             _relative(DATA_DIR / avatar),
             asr="hubert",
             encoder_onnx=_relative(feather_hubert_onnx),
-            max_frames=STREAM_MAX_FRAMES,
+            include_last_frame=True,
         )
-        self.processor.warm_up()
-        self.audio_chunks: deque[np.ndarray] = deque()
+        if len(self.silent_frames) != len(self.processor.full_body_img_list):
+            raise ValueError(
+                f"silence.mp4 has {len(self.silent_frames)} frames, but the avatar has "
+                f"{len(self.processor.full_body_img_list)} image/landmark pairs. "
+                "Upload a silence clip matching the training frames exactly."
+            )
+        if self.silence_size != self.processor.full_body_img_list[0].shape[:2]:
+            raise ValueError("silence.mp4 dimensions must match the avatar training frames. Upload a matching clip.")
+        self.audio_lock = threading.Lock()
+        self.audio_buffer = np.empty(0, dtype=np.int16)
+        self.audio_ended = False
+        self.last_audio_at = 0.0
+        self.speaking = False
+        self.current_frame = 0
+        self.current_direction = 1
 
     def provider_summary(self) -> str:
         providers = []
@@ -979,34 +1109,48 @@ class AvatarStream:
         if not audio_bytes:
             return
         audio = np.frombuffer(audio_bytes, dtype=np.int16)
-        for offset in range(0, audio.shape[0], FRAME_LEN):
-            chunk = audio[offset : offset + FRAME_LEN]
-            if chunk.shape[0] < FRAME_LEN:
-                chunk = np.pad(chunk, (0, FRAME_LEN - chunk.shape[0]))
-            self.audio_chunks.append(chunk.astype(np.int16))
+        with self.audio_lock:
+            self.audio_buffer = np.concatenate([self.audio_buffer, audio])
+            self.audio_ended = False
+            self.last_audio_at = time.monotonic()
 
     def queued_ms(self) -> int:
-        return round(len(self.audio_chunks) * FRAME_LEN / SAMPLE_RATE * 1000)
+        with self.audio_lock:
+            return round(len(self.audio_buffer) / SAMPLE_RATE * 1000)
 
-    def next_frame(self) -> tuple[np.ndarray | None, np.ndarray]:
-        if self.audio_chunks:
-            audio_frame = self.audio_chunks.popleft()
+    def finish_audio(self) -> None:
+        with self.audio_lock:
+            self.audio_ended = True
+
+    def clear_audio(self) -> None:
+        with self.audio_lock:
+            self.audio_buffer = np.empty(0, dtype=np.int16)
+            self.audio_ended = True
+
+    def next_packet(self) -> tuple[str, np.ndarray]:
+        samples = FRAME_LEN * PLAYBACK_CHUNK_FRAMES
+        with self.audio_lock:
+            available = len(self.audio_buffer)
+            flush_tail = self.audio_ended or time.monotonic() - self.last_audio_at >= AUDIO_TAIL_TIMEOUT
+            if available >= samples or (available and flush_tail):
+                audio = self.audio_buffer[:samples].copy()
+                self.audio_buffer = self.audio_buffer[len(audio):]
+                audio = np.pad(audio, (0, samples - len(audio)))
+            else:
+                audio = np.zeros(samples, dtype=np.int16)
+
+        picker = self.processor.frame_picker
+        self.current_frame, self.current_direction = picker.index, picker.step
+        speaking = bool(np.any(audio))
+        if speaking:
+            if not self.speaking:
+                self.processor.reset_realtime_audio()
+            image = _jpeg_data_url(self.processor.process_realtime(audio))
         else:
-            audio_frame = np.zeros([FRAME_LEN], dtype=np.int16)
-        img, playing_audio, check_img = self.processor.process(audio_frame)
-        if not check_img or img is None:
-            return None, playing_audio
-        return img, playing_audio
-
-    def next_packet(self, chunks: int = PLAYBACK_CHUNK_FRAMES) -> tuple[np.ndarray | None, np.ndarray]:
-        image: np.ndarray | None = None
-        audio_frames = []
-        for _ in range(max(1, chunks)):
-            next_image, playing_audio = self.next_frame()
-            if next_image is not None:
-                image = next_image
-            audio_frames.append(playing_audio)
-        return image, np.concatenate(audio_frames)
+            image = self.silent_frames[self.current_frame]
+        self.speaking = speaking
+        picker.advance()
+        return image, audio
 
 
 current_stream: AvatarStream | None = None
@@ -1084,6 +1228,7 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
         await websocket.close()
         return
 
+    stream = None
     try:
         await websocket.send_json({"type": "status", "message": "Preparing avatar stream..."})
         async with current_stream_lock:
@@ -1093,6 +1238,7 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             {
                 "type": "status",
                 "message": f"Streaming idle avatar. ONNX providers: {stream.provider_summary()}",
+                "ready": True,
             }
         )
 
@@ -1101,14 +1247,16 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
         max_lag_ms = 0.0
         tick_count = 0
         while True:
-            started = asyncio.get_running_loop().time()
-            img, playing_audio = await asyncio.to_thread(stream.next_packet)
-            if np.any(playing_audio):
-                await websocket.send_json({"type": "audio", "audio": _pcm16_to_base64(playing_audio)})
-            if img is not None:
-                message: dict[str, str] = {"type": "frame", "image": _jpeg_data_url(img)}
-                await websocket.send_json(message)
-            elapsed = asyncio.get_running_loop().time() - started
+            image, playing_audio = await asyncio.to_thread(stream.next_packet)
+            await websocket.send_json({
+                "type": "frame",
+                "image": image,
+                "audio": _pcm16_to_base64(playing_audio) if np.any(playing_audio) else None,
+                "duration": stream_tick_interval,
+                "frame_index": stream.current_frame,
+                "direction": stream.current_direction,
+                "speaking": stream.speaking,
+            })
             tick_count += 1
             next_tick_at += stream_tick_interval
             lag_ms = max(0.0, (asyncio.get_running_loop().time() - next_tick_at) * 1000)
@@ -1133,8 +1281,10 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             await websocket.send_json({"type": "error", "message": str(exc)})
     finally:
         async with current_stream_lock:
-            if current_stream is not None and current_stream.avatar == avatar:
+            if current_stream is stream:
                 current_stream = None
+        with contextlib.suppress(Exception):
+            await websocket.close()
 
 
 @app.websocket("/ws/conversation")
@@ -1213,6 +1363,7 @@ async def conversation_bridge(websocket: WebSocket) -> None:
                         elif event.get("type") == "session_updated":
                             await websocket.send_json({"type": "status", "message": "Realtime voice session ready."})
                         elif event.get("type") == "audio_end":
+                            stream.finish_audio()
                             await websocket.send_json({"type": "status", "message": "Realtime audio finished."})
                         else:
                             await websocket.send_json({"type": "status", "message": "Realtime voice event received."})
@@ -1226,6 +1377,7 @@ async def conversation_bridge(websocket: WebSocket) -> None:
             )
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             for task in done:
                 task.result()
     except WebSocketDisconnect:
@@ -1234,6 +1386,7 @@ async def conversation_bridge(websocket: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(exc)})
     finally:
+        stream.clear_audio()
         with contextlib.suppress(Exception):
             await websocket.close()
 

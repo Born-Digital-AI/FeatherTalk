@@ -216,6 +216,7 @@ class DiHumanProcessor:
         feather_right_context_frames: int = FEATHER_RIGHT_CONTEXT_FRAMES,
         force_cpu_onnx: bool = False,
         max_frames: Optional[int] = None,
+        include_last_frame: bool = False,
     ):
         self.data_path = data_path
         self.asr = _normalize_asr(asr)
@@ -224,7 +225,9 @@ class DiHumanProcessor:
         self.feather_right_context_frames = max(0, int(feather_right_context_frames))
 
         full_body_img_dir, lms_dir = _resolve_asset_dirs(data_path)
-        self.full_body_img_list, self.bbox_list = self._load_assets(full_body_img_dir, lms_dir, max_frames)
+        self.full_body_img_list, self.bbox_list = self._load_assets(
+            full_body_img_dir, lms_dir, max_frames, include_last_frame
+        )
         self.frame_picker = _BounceIndex(len(self.bbox_list))
 
         unet_path = _resolve_default_path(unet_onnx, data_path, "unet.onnx")
@@ -258,6 +261,7 @@ class DiHumanProcessor:
         img_dir: str,
         lms_dir: str,
         max_frames: Optional[int] = None,
+        include_last_frame: bool = False,
     ) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
         img_paths = _sorted_files(img_dir, ".jpg")
         if not img_paths:
@@ -269,7 +273,7 @@ class DiHumanProcessor:
             raise FileNotFoundError(f"Need at least 2 image/landmark pairs under {img_dir} and {lms_dir}.")
 
         # The legacy preprocessing often leaves the final landmark frame less reliable.
-        n_frames = n_available - 1 if n_available > 2 else n_available
+        n_frames = n_available - 1 if n_available > 2 and not include_last_frame else n_available
         if max_frames is not None:
             n_frames = min(n_frames, max(2, int(max_frames)))
         images: List[np.ndarray] = []
@@ -346,6 +350,42 @@ class DiHumanProcessor:
         self.counter = 0
         self.is_processing = True
 
+    def reset_realtime_audio(self) -> None:
+        """Start a new utterance without changing the shared playback cursor."""
+        self._reset_audio_state()
+
+    def process_realtime(self, audio: np.ndarray) -> np.ndarray:
+        """Render exactly one HuBERT frame at the externally controlled cursor.
+
+        Audio is one video interval, rather than one 10 ms encoder chunk. Missing
+        right context is edge-padded in feature space, so starting speech does
+        not move the avatar ahead while waiting for the encoder to prime.
+        This method never advances frame_picker or synthesizes idle audio.
+        """
+        if self.asr != ASR_FEATHER:
+            raise ValueError("Realtime packet inference requires FeatherHuBERT.")
+        audio_float = audio.astype(np.float32) / 32768.0
+        self.feather_audio_buffer = np.concatenate([self.feather_audio_buffer, audio_float])
+        new_features = self._run_feather_encoder(pad_right_context=True)
+        if new_features.shape[0]:
+            self.using_feat = np.concatenate([self.using_feat, new_features], axis=0)
+        # Match training's four frames of left context. Keeping eight past
+        # frames would put speech several frames behind the packet's audio.
+        self.using_feat = self.using_feat[-(USING_FEAT_INIT + 1):]
+        history = self.using_feat
+        if len(history) < UNET_FEAT_WINDOW:
+            self.using_feat = np.pad(
+                history, ((0, UNET_FEAT_WINDOW - len(history)), (0, 0), (0, 0)), mode="edge"
+            )
+        try:
+            self.last_frame_index = self.frame_picker.index
+            return self._run_unet(
+                self.full_body_img_list[self.last_frame_index].copy(),
+                self.bbox_list[self.last_frame_index],
+            )
+        finally:
+            self.using_feat = history
+
     def _detect_silence(self, audio_frame: np.ndarray):
         if not np.any(audio_frame):
             if not self.silence:
@@ -417,7 +457,7 @@ class DiHumanProcessor:
         outs = self.ort_ae.run(None, inputs)
         return outs[0].astype(np.float32)
 
-    def _run_feather_encoder(self) -> np.ndarray:
+    def _run_feather_encoder(self, pad_right_context: bool = False) -> np.ndarray:
         if self._feather_expected_frames is None:
             from data_utils.feather_hubert.feather_hubert import expected_hubert_frames
 
@@ -431,7 +471,16 @@ class DiHumanProcessor:
                 normalized_buffer = (
                     normalized_buffer - normalized_buffer.mean()
                 ) / np.sqrt(normalized_buffer.var() + 1e-7)
-            while self.feather_audio_buffer.shape[0] >= self.feather_next_window_start + FEATHER_STREAM_WINDOW_SAMPLES:
+                if pad_right_context:
+                    # The 720-sample window needs 80 samples beyond the current
+                    # 640-sample video interval. Pad only this encoder input;
+                    # retaining padding in waveform history would shift speech.
+                    normalized_buffer = np.pad(
+                        normalized_buffer,
+                        (0, FEATHER_STREAM_WINDOW_SAMPLES - FEATHER_STREAM_HOP_SAMPLES),
+                        mode="edge",
+                    )
+            while normalized_buffer.shape[0] >= self.feather_next_window_start + FEATHER_STREAM_WINDOW_SAMPLES:
                 start = self.feather_next_window_start
                 end = start + FEATHER_STREAM_WINDOW_SAMPLES
                 speech = normalized_buffer[start:end]
