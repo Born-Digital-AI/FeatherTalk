@@ -6,6 +6,7 @@ checkpoint 保存 {epoch, model, optimizer} 三件套，支持 --resume 断点�
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 
@@ -112,15 +113,25 @@ class PerceptualLoss:
         return self.criterion(f_fake, f_real)
 
 
-def save_checkpoint(path: str, model: nn.Module, optimizer: optim.Optimizer, epoch: int):
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        },
-        path,
-    )
+def save_checkpoint(
+    path: str, model: nn.Module, optimizer: optim.Optimizer, epoch: int,
+    train_loss: float | None = None,
+):
+    checkpoint = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    if train_loss is not None:
+        checkpoint["train_loss"] = train_loss
+    # Replace only after a complete write, preserving the old file on failure.
+    temporary_path = path + ".tmp"
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def resume_if_any(
@@ -169,6 +180,8 @@ def train_one_epoch(
     dataset_len: int,
 ):
     net.train()
+    total_loss = 0.0
+    sample_count = 0
     with tqdm(total=dataset_len, desc=progress_desc, unit="img") as p:
         for imgs, labels, audio_feat in loader:
             imgs = imgs.to(device)
@@ -182,8 +195,16 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
 
-            p.set_postfix({"loss (batch)": loss.item()})
-            p.update(imgs.shape[0])
+            batch_loss = loss.item()
+            batch_size = imgs.shape[0]
+            total_loss += batch_loss * batch_size
+            sample_count += batch_size
+            p.set_postfix({"loss (batch)": batch_loss})
+            p.update(batch_size)
+
+    if sample_count == 0:
+        raise ValueError("Cannot compute epoch loss: no training samples")
+    return total_loss / sample_count
 
 
 def dump_sample(net: nn.Module, dataset, save_dir: str, epoch: int, device: torch.device):
@@ -220,23 +241,45 @@ def main():
     perceptual_loss = PerceptualLoss(nn.MSELoss(), device=device)
 
     start_epoch = resume_if_any(args.resume, net, optimizer, device)
+    best_path = os.path.join(args.save_dir, "best.pth")
+    best_loss = float("inf")
+    if args.resume:
+        # Resume the comparison as well as the model. The workflow may have
+        # already promoted best.pth to last.pth and removed intermediate files.
+        has_best = os.path.isfile(best_path)
+        previous = torch.load(best_path if has_best else args.resume, map_location="cpu")
+        if isinstance(previous, dict):
+            previous_loss = previous.get("train_loss", float("inf"))
+            if math.isfinite(previous_loss):
+                best_loss = previous_loss
+                if not has_best:
+                    save_checkpoint(best_path, net, optimizer, start_epoch - 1, best_loss)
+        del previous
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(
+        epoch_loss = train_one_epoch(
             net, loader, optimizer,
             pixel_criterion, perceptual_loss,
             device,
             progress_desc=f"Epoch {epoch + 1}/{args.epochs}",
             dataset_len=len(dataset),
         )
+        print(f"[train] epoch={epoch + 1}, train_loss={epoch_loss:.6f}")
+        if math.isfinite(epoch_loss) and epoch_loss < best_loss:
+            save_checkpoint(best_path, net, optimizer, epoch, epoch_loss)
+            best_loss = epoch_loss
+            print(f"[best] epoch={epoch + 1}, train_loss={best_loss:.6f}, saved to {best_path}")
 
         is_save_epoch = (epoch + 1) % args.save_every == 0
         if is_save_epoch or epoch == args.epochs - 1:
-            save_checkpoint(os.path.join(args.save_dir, f"{epoch}.pth"), net, optimizer, epoch)
-            save_checkpoint(os.path.join(args.save_dir, "last.pth"), net, optimizer, epoch)
+            save_checkpoint(os.path.join(args.save_dir, f"{epoch}.pth"), net, optimizer, epoch, epoch_loss)
+            save_checkpoint(os.path.join(args.save_dir, "last.pth"), net, optimizer, epoch, epoch_loss)
 
         if args.see_res:
             dump_sample(net, dataset, args.see_res_dir, epoch, device)
+
+    if not math.isfinite(best_loss):
+        raise RuntimeError("No finite training loss: cannot select a best checkpoint")
 
 
 if __name__ == "__main__":

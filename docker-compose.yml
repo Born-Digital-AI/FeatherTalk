@@ -15,6 +15,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
       PYTHONUNBUFFERED: "1"
+      FEATHER_REALTIME_UNET_BATCH: ${FEATHER_REALTIME_UNET_BATCH:-1}
     volumes:
       - ./audio:/app/audio
       - ./checkpoints:/app/checkpoints

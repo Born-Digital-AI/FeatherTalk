@@ -76,6 +76,7 @@ def main():
             net, (img, audio), args.onnx_path,
             input_names=['input', 'audio'],
             output_names=['output'],
+            dynamic_axes={'input': {0: 'batch'}, 'audio': {0: 'batch'}, 'output': {0: 'batch'}},
             opset_version=args.opset,
             export_params=True,
             dynamo=False,

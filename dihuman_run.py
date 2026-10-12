@@ -18,12 +18,15 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import warnings
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Sequence
 
 import cv2
 import numpy as np
 import onnxruntime
+from frame_store import ImageFrames
 from face_utils import (
     FACE_BORDER,
     FACE_INNER_SIZE,
@@ -69,6 +72,7 @@ FEATHER_DEFAULT_OUTPUT_DIM = 1024
 FEATHER_RIGHT_CONTEXT_FRAMES = 4
 FEATHER_STREAM_WINDOW_SAMPLES = 720
 FEATHER_STREAM_HOP_SAMPLES = 640
+FEATHER_REALTIME_HISTORY_SAMPLES = 2 * SAMPLE_RATE
 
 SILENCE_THRESHOLD = 100
 UNET_FEAT_WINDOW = 8
@@ -217,6 +221,8 @@ class DiHumanProcessor:
         force_cpu_onnx: bool = False,
         max_frames: Optional[int] = None,
         include_last_frame: bool = False,
+        defer_models: bool = False,
+        lazy_assets: bool = False,
     ):
         self.data_path = data_path
         self.asr = _normalize_asr(asr)
@@ -226,14 +232,15 @@ class DiHumanProcessor:
 
         full_body_img_dir, lms_dir = _resolve_asset_dirs(data_path)
         self.full_body_img_list, self.bbox_list = self._load_assets(
-            full_body_img_dir, lms_dir, max_frames, include_last_frame
+            full_body_img_dir, lms_dir, max_frames, include_last_frame, lazy_assets
         )
         self.frame_picker = _BounceIndex(len(self.bbox_list))
 
-        unet_path = _resolve_default_path(unet_onnx, data_path, "unet.onnx")
-        if not os.path.exists(unet_path):
-            raise FileNotFoundError(f"UNet ONNX not found: {unet_path}")
-        self.ort_unet = onnxruntime.InferenceSession(unet_path, providers=self.providers)
+        self._unet_path = _resolve_default_path(unet_onnx, data_path, "unet.onnx")
+        self._encoder_onnx = encoder_onnx
+        self._feather_checkpoint = feather_hubert_checkpoint
+        self._models_initialized = False
+        self.ort_unet = None
 
         self.ort_ae: Optional[onnxruntime.InferenceSession] = None
         self.feather_model: Any = None
@@ -244,10 +251,8 @@ class DiHumanProcessor:
         self._feather_expected_frames: Optional[Callable[[int], int]] = None
         self._feather_make_even: Optional[Callable[[Any], Any]] = None
 
-        if self.asr == ASR_WENET:
-            self._init_wenet_encoder(_resolve_default_path(encoder_onnx, data_path, "encoder.onnx"))
-        else:
-            self._init_feather_encoder(encoder_onnx, feather_hubert_checkpoint)
+        if not defer_models:
+            self.initialize_models()
 
         self.counter = 0
         self.empty_audio_counter = 56
@@ -256,13 +261,27 @@ class DiHumanProcessor:
         self.last_frame_index = 0
         self._reset_audio_state()
 
+    def initialize_models(self) -> None:
+        """Load encoder and UNet sessions once for speech or inferred idle."""
+        if self._models_initialized:
+            return
+        if not os.path.exists(self._unet_path):
+            raise FileNotFoundError(f"UNet ONNX not found: {self._unet_path}")
+        self.ort_unet = onnxruntime.InferenceSession(self._unet_path, providers=self.providers)
+        if self.asr == ASR_WENET:
+            self._init_wenet_encoder(_resolve_default_path(self._encoder_onnx, self.data_path, "encoder.onnx"))
+        else:
+            self._init_feather_encoder(self._encoder_onnx, self._feather_checkpoint)
+        self._models_initialized = True
+
     def _load_assets(
         self,
         img_dir: str,
         lms_dir: str,
         max_frames: Optional[int] = None,
         include_last_frame: bool = False,
-    ) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+        lazy_assets: bool = False,
+    ) -> Tuple[Sequence[np.ndarray], List[Tuple[int, int, int, int]]]:
         img_paths = _sorted_files(img_dir, ".jpg")
         if not img_paths:
             img_paths = _sorted_files(img_dir, ".png")
@@ -276,6 +295,10 @@ class DiHumanProcessor:
         n_frames = n_available - 1 if n_available > 2 and not include_last_frame else n_available
         if max_frames is not None:
             n_frames = min(n_frames, max(2, int(max_frames)))
+        self.source_image_paths = img_paths[:n_frames]
+        if lazy_assets:
+            boxes = [_read_landmarks_to_bbox(str(path)) for path in lms_paths[:n_frames]]
+            return ImageFrames(self.source_image_paths), boxes
         images: List[np.ndarray] = []
         boxes: List[Tuple[int, int, int, int]] = []
         for img_path, lms_path in zip(img_paths[:n_frames], lms_paths[:n_frames]):
@@ -354,37 +377,162 @@ class DiHumanProcessor:
         """Start a new utterance without changing the shared playback cursor."""
         self._reset_audio_state()
 
-    def process_realtime(self, audio: np.ndarray) -> np.ndarray:
-        """Render exactly one HuBERT frame at the externally controlled cursor.
+    def _encode_feather_waveform(self, speech: np.ndarray) -> np.ndarray:
+        """Encode one contextual waveform using the same model in either runtime."""
+        if self.ort_ae is not None:
+            name = self.ort_ae.get_inputs()[0].name
+            return self.ort_ae.run(None, {name: speech[None, :]})[0][0].astype(np.float32)
+        if self.feather_model is None or self._torch is None:
+            raise RuntimeError("FeatherHuBERT checkpoint model is not initialized.")
+        with self._torch.no_grad():
+            tensor = self._torch.from_numpy(speech).to(self.feather_device)[None]
+            return self.feather_model(tensor)[0].detach().cpu().numpy().astype(np.float32)
 
-        Audio is one video interval, rather than one 10 ms encoder chunk. Missing
-        right context is edge-padded in feature space, so starting speech does
-        not move the avatar ahead while waiting for the encoder to prime.
-        This method never advances frame_picker or synthesizes idle audio.
+    def prepare_offline_features(self, audio: np.ndarray) -> np.ndarray:
+        """Use the offline extractor on a complete, unpadded PCM16 reply.
+
+        FeatherHuBERT's GroupNorm uses temporal statistics, so short streaming
+        windows cannot reproduce features extracted from a complete utterance.
+        Playback may pad its final PCM packet; encoder input must not be padded.
+        """
+        from data_utils.feather_hubert.feather_hubert import (
+            get_feather_hubert_from_16k_speech, make_even_first_dim,
+        )
+
+        if self.asr != ASR_FEATHER or self.feather_model is None:
+            raise RuntimeError("Offline quality requires the FeatherHuBERT checkpoint model.")
+        hop = FEATHER_STREAM_HOP_SAMPLES
+        frame_count = (len(audio) + hop - 1) // hop
+        hidden = get_feather_hubert_from_16k_speech(
+            audio.astype(np.float32) / 32768.0,
+            self.feather_model, device=self.feather_device,
+        )
+        features = make_even_first_dim(hidden).numpy().reshape(-1, 2, self.feather_output_dim)
+        windows = np.zeros((frame_count, UNET_FEAT_WINDOW, 2, self.feather_output_dim), np.float32)
+        for index in range(frame_count):
+            left = index - USING_FEAT_INIT
+            start, end = max(0, left), min(len(features), left + UNET_FEAT_WINDOW)
+            if end > start:
+                windows[index, start - left:end - left] = features[start:end]
+        return windows
+
+    def prepare_realtime_features(self, audio: np.ndarray, frame_count: int) -> np.ndarray:
+        """Encode history + a playback batch + real lookahead in one model call.
+
+        Only the playback batch enters history. Lookahead remains in the caller's
+        audio queue and is encoded again with the next overlapping window.
+        Windows match training: four past frames, the current frame, three future
+        frames. At utterance boundaries missing features are zero, never repeated.
         """
         if self.asr != ASR_FEATHER:
             raise ValueError("Realtime packet inference requires FeatherHuBERT.")
+        hop = FEATHER_STREAM_HOP_SAMPLES
+        if frame_count <= 0 or len(audio) < frame_count * hop:
+            raise ValueError("Realtime audio must contain the entire playback batch.")
         audio_float = audio.astype(np.float32) / 32768.0
-        self.feather_audio_buffer = np.concatenate([self.feather_audio_buffer, audio_float])
-        new_features = self._run_feather_encoder(pad_right_context=True)
-        if new_features.shape[0]:
-            self.using_feat = np.concatenate([self.using_feat, new_features], axis=0)
-        # Match training's four frames of left context. Keeping eight past
-        # frames would put speech several frames behind the packet's audio.
-        self.using_feat = self.using_feat[-(USING_FEAT_INIT + 1):]
+        history_frames = len(self.feather_audio_buffer) // hop
+        speech = np.concatenate([self.feather_audio_buffer, audio_float])
+        real_frames = len(speech) // hop
+        # 80 extra waveform samples produce both tokens for the final interval.
+        required = real_frames * hop + (FEATHER_STREAM_WINDOW_SAMPLES - hop)
+        if len(speech) < required:
+            speech = np.pad(speech, (0, required - len(speech)))
+        speech = (speech - speech.mean()) / np.sqrt(speech.var() + 1e-7)
+        hidden = self._encode_feather_waveform(speech)
+        if len(hidden) < real_frames * 2:
+            raise RuntimeError("FeatherHuBERT returned too few tokens for the audio window.")
+        features = hidden[:real_frames * 2].reshape(real_frames, 2, self.feather_output_dim)
+        windows = np.zeros((frame_count, UNET_FEAT_WINDOW, 2, self.feather_output_dim), np.float32)
+        for index in range(frame_count):
+            left = history_frames + index - USING_FEAT_INIT
+            start, end = max(0, left), min(real_frames, left + UNET_FEAT_WINDOW)
+            windows[index, start - left:end - left] = features[start:end]
+        self.feather_audio_buffer = np.concatenate([
+            self.feather_audio_buffer, audio_float[:frame_count * hop]
+        ])[-FEATHER_REALTIME_HISTORY_SAMPLES:]
+        return windows
+
+    def process_realtime(self, audio: np.ndarray, features: Optional[np.ndarray] = None) -> np.ndarray:
+        """Render one frame with features prepared for its matching audio interval."""
+        if features is None:
+            features = self.prepare_realtime_features(audio, 1)[0]
         history = self.using_feat
-        if len(history) < UNET_FEAT_WINDOW:
-            self.using_feat = np.pad(
-                history, ((0, UNET_FEAT_WINDOW - len(history)), (0, 0), (0, 0)), mode="edge"
-            )
+        self.using_feat = features
+        cached_input = getattr(self, "_realtime_image_input", None)
         try:
             self.last_frame_index = self.frame_picker.index
+            self._realtime_image_input = self.prepare_frame_input(self.last_frame_index)
             return self._run_unet(
                 self.full_body_img_list[self.last_frame_index].copy(),
                 self.bbox_list[self.last_frame_index],
             )
         finally:
             self.using_feat = history
+            self._realtime_image_input = cached_input
+
+    def prepare_frame_input(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Cache static FP32 inputs; audio features remain specific to each frame."""
+        if not hasattr(self, "_realtime_input_cache"):
+            self._realtime_input_cache = OrderedDict()
+        cache = self._realtime_input_cache
+        if index not in cache:
+            cache[index] = _build_unet_inputs(crop_face(self.full_body_img_list[index], self.bbox_list[index]))
+        cache.move_to_end(index)
+        while len(cache) > max(1, getattr(self, "realtime_input_cache_size", 64)):
+            expired, _ = cache.popitem(last=False)
+            getattr(self, "_realtime_gpu_inputs", {}).pop(expired, None)
+        return cache[index]
+
+    def enable_realtime_io_binding(self) -> bool:
+        """Reuse FP32 CUDA tensors when CUDA is available; retain normal CPU execution."""
+        self.realtime_io_binding = "CUDAExecutionProvider" in self.ort_unet.get_providers()
+        return self.realtime_io_binding
+
+    def supports_realtime_batch(self) -> bool:
+        shape = self.ort_unet.get_inputs()[0].shape
+        return bool(shape and not isinstance(shape[0], int))
+
+    def process_realtime_batch(self, frames: List[Tuple[int, np.ndarray]]) -> List[np.ndarray]:
+        """Optional FP32 batching for exports with a dynamic batch dimension."""
+        if not frames:
+            return []
+        cached = [self.prepare_frame_input(index) for index, _ in frames]
+        image_input = np.concatenate([image for image, _ in cached], axis=0)
+        audio_input = np.stack([features.reshape(16, 32, 32) for _, features in frames])
+        output = self.ort_unet.run(None, {
+            self.ort_unet.get_inputs()[0].name: image_input,
+            self.ort_unet.get_inputs()[1].name: audio_input,
+        })[0]
+        images = []
+        for (index, _), (_, original), prediction in zip(frames, cached, output):
+            image = self.full_body_img_list[index].copy()
+            xmin, ymin, xmax, ymax = self.bbox_list[index]
+            crop_h, crop_w = image[ymin:ymax, xmin:xmax].shape[:2]
+            crop = original.copy()
+            crop[FACE_BORDER:FACE_BORDER + FACE_INNER_SIZE, FACE_BORDER:FACE_BORDER + FACE_INNER_SIZE] = (
+                prediction.transpose(1, 2, 0) * 255
+            ).astype(np.uint8)
+            image[ymin:ymax, xmin:xmax] = cv2.resize(crop, (crop_w, crop_h))
+            images.append(image)
+        return images
+
+    def _run_bound_unet(self, image: np.ndarray, audio: np.ndarray) -> np.ndarray:
+        if not hasattr(self, "_realtime_gpu_inputs"):
+            self._realtime_gpu_inputs = {}
+            self._realtime_gpu_audio = onnxruntime.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(audio), "cuda", 0)
+            self._realtime_gpu_output = onnxruntime.OrtValue.ortvalue_from_shape_and_type(
+                [1, 3, FACE_INNER_SIZE, FACE_INNER_SIZE], np.float32, "cuda", 0,
+            )
+        index = self.last_frame_index
+        if index not in self._realtime_gpu_inputs:
+            self._realtime_gpu_inputs[index] = onnxruntime.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(image), "cuda", 0)
+        self._realtime_gpu_audio.update_inplace(np.ascontiguousarray(audio))
+        binding = self.ort_unet.io_binding()
+        binding.bind_ortvalue_input(self.ort_unet.get_inputs()[0].name, self._realtime_gpu_inputs[index])
+        binding.bind_ortvalue_input(self.ort_unet.get_inputs()[1].name, self._realtime_gpu_audio)
+        binding.bind_ortvalue_output(self.ort_unet.get_outputs()[0].name, self._realtime_gpu_output)
+        self.ort_unet.run_with_iobinding(binding)
+        return self._realtime_gpu_output.numpy()
 
     def _detect_silence(self, audio_frame: np.ndarray):
         if not np.any(audio_frame):
@@ -542,16 +690,31 @@ class DiHumanProcessor:
     def _run_unet(self, img: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
         xmin, ymin, xmax, ymax = bbox
         crop_h, crop_w = img[ymin:ymax, xmin:xmax].shape[:2]
-        crop_img = crop_face(img, bbox)
-        onnx_in, crop_ori = _build_unet_inputs(crop_img)
+        cached = getattr(self, "_realtime_image_input", None)
+        if cached is None:
+            onnx_in, crop_ori = _build_unet_inputs(crop_face(img, bbox))
+        else:
+            onnx_in, original = cached
+            crop_ori = original.copy()
 
         audio_feat = self._audio_feat_for_unet()
         inputs = {
             self.ort_unet.get_inputs()[0].name: onnx_in,
             self.ort_unet.get_inputs()[1].name: audio_feat,
         }
-        outs = self.ort_unet.run(None, inputs)
-        pred = (outs[0][0].transpose(1, 2, 0) * 255).astype(np.uint8)
+        if cached is not None and getattr(self, "realtime_io_binding", False):
+            try:
+                output = self._run_bound_unet(onnx_in, audio_feat)
+            except Exception as exc:
+                # Some exported graphs/runtimes cannot bind CUDA tensors. Keep
+                # the exact FP32 model and continue through the ordinary session.
+                self.realtime_io_binding = False
+                self._realtime_gpu_inputs = {}
+                warnings.warn(f"CUDA I/O binding disabled: {exc}", RuntimeWarning)
+                output = self.ort_unet.run(None, inputs)[0]
+        else:
+            output = self.ort_unet.run(None, inputs)[0]
+        pred = (output[0].transpose(1, 2, 0) * 255).astype(np.uint8)
 
         b = FACE_BORDER
         crop_ori[b:b + FACE_INNER_SIZE, b:b + FACE_INNER_SIZE] = pred

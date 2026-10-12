@@ -42,5 +42,7 @@ python train.py \
   --see_res \
   --see_res_dir "$preview_dir"
 
-echo "[4/4] Cleaning intermediate checkpoints"
+echo "[4/4] Promoting the best training-loss checkpoint to last.pth and cleaning intermediates"
+cp "${checkpoint_dir}/best.pth" "${checkpoint_dir}/last.pth.tmp"
+mv -f "${checkpoint_dir}/last.pth.tmp" "${checkpoint_dir}/last.pth"
 find "$checkpoint_dir" -maxdepth 1 -type f -name "*.pth" ! -name "last.pth" -delete

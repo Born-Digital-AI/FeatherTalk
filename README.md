@@ -309,6 +309,158 @@ generated files can be reused without rebuilding the image:
 ./outputs     -> /app/outputs
 ```
 
+### Realtime audio context
+
+The realtime voice bridge expects mono PCM16. It uses the sample rate declared
+by the server (including nested metadata) and remembers it for subsequent
+chunks. If no rate is declared, `REALTIME_SOURCE_SAMPLE_RATE` in `app.py` defaults
+to 24 kHz; PCM bytes alone cannot identify their sample rate. Incoming audio is
+converted to 16 kHz with a continuous SoXR resampler. `audio_end` flushes its
+remaining samples.
+
+The web app defaults to offline quality. It buffers each reply until `audio_end`
+(or a 500 ms receive timeout), then runs the same FeatherHuBERT checkpoint and
+feature extractor as offline inference, including whole-reply normalization and
+the extractor's 20-second chunk boundaries. The UNet receives four past frames,
+the current frame and three future frames. Final playback padding does not enter
+the encoder. Silent intervals within a reply retain their feature context.
+Audio and images play together at 25 FPS. This adds the time needed to receive
+and encode the complete reply before speech starts; partial replies split by a
+timeout cannot have identical features to one complete offline recording.
+
+Idle playback uses a shared VP9 lossless WebM through native browser HTTP range
+playback, independently of inference and WebSocket delivery. On the first start,
+the app decodes `data/<avatar>/silence.mp4`, loads the speech models and performs
+offline inference with zero-valued PCM audio for the duration of the clip. The
+UNet receives the silent-video pixels, not the training-video frames. Its output
+is used for idle playback, including the model's predicted mouth shape and face
+appearance. The clip must match the avatar source dimensions, frame count and
+25 FPS. ffmpeg packs the inferred frames into a `0..N-1,N-2..1` lossless RGB loop under
+`outputs/realtime-cache/`, without chroma subsampling or intermediate PNGs.
+The reverse leg comes directly from cached frames, avoiding a second loop buffer
+in ffmpeg. Inferred frames are spooled losslessly to temporary disk storage;
+only two decoded frames are retained at a time. The completed WebM remains in
+RAM, and the idle endpoint serves it without rendering or encoding again.
+Training JPEG/PNG images load lazily with an eight-frame cache; the source silent
+video is decoded sequentially with a two-frame cache. Native resolution and
+pixels are preserved without holding three complete raw videos in memory.
+After server restart, the existing inferred WebM is read into RAM and decoded
+frames are accessed lazily without repeating inference or encoding. Asset changes are checked
+with a directory metadata scan. Changing the silent clip, avatar images/landmarks,
+UNet or audio encoder invalidates the inferred cache.
+
+The first uncached start waits for model loading, any required ONNX export,
+silent inference and encoding. The generated file/cache key is shared by all users
+of that avatar and does not contain a session/user ID. With a valid disk cache,
+idle preparation skips model loading as well as inference and encoding; speech
+models load in the background after the cached idle stream is initialized.
+Loaded models remain in RAM across stream stops
+and page reloads, so repeated starts reuse the processor and generated idle media.
+Source-image input caches are isolated during idle generation and restored for
+speech. Each connection gets fresh audio buffers and a reset playback cursor.
+Once prepared, watching idle does not run inference. Offline speech quality
+remains unchanged.
+
+To prepare an avatar once before users open it, run inside the GPU container:
+
+```bash
+docker compose exec feathertalk python scripts/prepare_idle_cache.py mousa4
+```
+
+The command prepares the same persistent `outputs/realtime-cache/` file used by
+the server. The next user and later server restarts reuse it as long as the
+avatar/model/rendering dependencies remain unchanged. The existing stream
+ownership restriction still allows only one active stream at a time.
+
+During preparation the server sends a status update every five seconds to keep
+the WebSocket active through long model loads and idle generation. Startup errors
+are logged with their traceback, and disconnects report the WebSocket close code
+and whether they occurred during preparation or playback. The browser distinguishes
+an explicit stop from an unexpected disconnect. Logs identify the bounded frame
+caches. A process killed by the OS for insufficient memory may end without a
+Python traceback. Temporary lossless frame storage needs available disk space in
+`outputs/realtime-cache/`; it is released when the process/cache entry ends.
+
+The browser receives the same immutable `/api/realtime/idle/<cache-key>.webm`
+URL for every user/session. Byte-range responses allow initial playback and
+seeking without waiting for the complete two-minute video download; the browser's
+HTTP cache can reuse unchanged media on later visits. The legacy blob/IndexedDB
+path remains available for older stream configurations. It also shares up to 64
+decoded speech background images across connections, with a key that changes
+when avatar assets change. A completely cold cache still requires source decoding,
+model loading, silent inference and initial encoding once. Logs include
+`Idle ready: ... source=silent offline inference on silence.mp4 speech_models=loaded/background preload` at startup and
+`Loading speech models: ... reason=background preload/received audio` when
+models load, followed by `Speech models ready` with the loading duration.
+They also report cache hits/misses, process IDs, encoding time and video size.
+ffmpeg needs `libvpx-vp9`, and the browser must support RGB VP9/WebM.
+
+Speech sends only the generated face region as a lossless PNG, with its matching
+PCM audio. Speaking and inferred idle use the same decoded `silence.mp4`
+source pixels; speech backgrounds are served as lossless PNGs. The browser
+uses PNGs extracted once to `outputs/realtime-cache/source-<key>/`. Speech
+reads these independent images instead of seeking inside the MP4 for every
+reverse frame, and HTTP serves the saved PNG bytes without recompressing them.
+The cache is shared across starts/users and survives server restarts. Replacing
+`silence.mp4` invalidates the source cache; extraction retains only a bounded
+number of decoded frames in RAM. First preparation needs extra disk space and
+time to extract the source images; subsequent starts reuse them. The browser
+decodes images before scheduling and uses one audio clock. It reserves the
+first speech frame at a future idle frame boundary and immediately prefetches
+12 speech backgrounds. Startup waits for 12 decoded speech frames (480 ms at
+25 FPS), or the whole utterance if shorter. Native idle advances to the exact
+predecessor frame before audio is scheduled. If delivery is late, idle holds
+there while the buffer fills; moving the audio deadline never changes the
+source-frame cursor. Returning to idle advances
+one frame from the last displayed speech frame, preserving the ping-pong phase
+and direction (except at the normal endpoint reversal). The hidden idle video
+seeks while speech is still playing, ready for the final audio deadline; if
+seeking is delayed, the last speech image remains visible until it completes.
+Both modes draw onto the same canvas, with identical scaling. A
+background producer renders ahead into 24 slots; playback acknowledgments bound
+the WebSocket delivery window to another 24 frames. Cancelling a conversation
+also stops scheduled audio and invalidates images still being decoded.
+
+The UNet uses a bounded cache of 64 static FP32 image inputs and reusable CUDA
+I/O tensors when available. Unsupported I/O binding falls back to the ordinary
+FP32 ONNX session. Features still come from the complete offline-quality reply;
+FP16, quantization and shorter feature windows are not enabled. An approximately
+800 ms initial playback reservation absorbs initial rendering/delivery jitter
+(increased when recent rendering is slower). Sustained inference below 25 FPS
+can still exhaust the buffer; it needs hardware/throughput improvements.
+
+Realtime status reports encoder, rendering and PNG patch timings. Benchmark the
+actual GPU, checkpoint and audio with:
+
+```bash
+python tools/benchmark_realtime.py --avatar YOUR_AVATAR --audio audio/reply.wav
+```
+
+The JSON includes providers/device, render p95, rendering-plus-encoding FPS and
+patch bandwidth. It excludes HTTP background cache misses, network and browser
+decode. Verify that both FeatherHuBERT and UNet use the intended GPU.
+
+New `pth2onnx.py` exports support a dynamic batch dimension. Existing exports
+continue working at batch 1 and are refreshed when `last.pth` is newer. To try
+larger FP32 batches, explicitly re-export and measure parity/throughput first:
+
+```bash
+python pth2onnx.py --checkpoint checkpoints/YOUR_AVATAR/last.pth --onnx_path data/YOUR_AVATAR/unet.onnx --asr hubert --unet original
+python tools/benchmark_realtime.py --avatar YOUR_AVATAR --audio audio/reply.wav --batch 4
+```
+
+Only after checking the reported pixel differences and speed, set
+`FEATHER_REALTIME_UNET_BATCH=4` (also forwarded by Docker Compose). Default is 1;
+fixed-batch older exports retain batch 1. Batching and I/O binding use FP32;
+batch convolution algorithms can still produce small numerical differences.
+
+For lower latency, callers can explicitly construct
+`AvatarStream(avatar, offline_quality=False)`. This uses the existing ONNX encoder,
+320 ms batches, 320 ms lookahead and up to 2 seconds of waveform history. Tune
+`REALTIME_BATCH_FRAMES`, `REALTIME_LOOKAHEAD_FRAMES`, `AUDIO_TAIL_TIMEOUT` and
+`FEATHER_REALTIME_HISTORY_SAMPLES` for that path. Its features cannot match
+offline extraction because GroupNorm statistics depend on the full input window.
+
 ## Required Weights / 必需权重
 
 The lightweight preprocessing models are included in this source release:
@@ -410,7 +562,13 @@ Run preprocessing and training with:
 The script runs FeatherHuBERT preprocessing, trains with `train.py`,
 writes checkpoints to `checkpoints/<avatar_name>`, writes preview frames to
 `outputs/train_preview`, and removes intermediate `.pth` checkpoints after training while
-keeping `last.pth`.
+keeping `last.pth`. During training, `best.pth` is updated only when the
+sample-weighted mean training loss for an epoch improves (L1 + 0.01 × perceptual
+loss). After successful training, the script promotes `best.pth` to `last.pth`
+before cleanup, so the final model is the best epoch by training loss, rather
+than automatically the final epoch. This is a training metric, not a validation
+or visual-quality score. While training is running, `last.pth` still holds the
+latest periodic checkpoint for resuming; `best.pth` holds the best model so far.
 
 HuBERT 和 FeatherHuBERT 在本项目中使用同一种 `hubert` 特征形状，因此走 25fps 路线。Wenet 走 20fps 路线。
 
