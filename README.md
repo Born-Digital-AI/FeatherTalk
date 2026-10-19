@@ -311,6 +311,117 @@ generated files can be reused without rebuilding the image:
 
 ### Realtime audio context
 
+The default realtime transport is now WebRTC. The backend delivers complete
+H.264 video and Opus audio to one native `<video>` element. `/ws/media` carries
+signaling, controls and metrics; media does not pass through that WebSocket.
+The backend owns the frame cursor and media timestamps. The browser neither
+downloads per-frame backgrounds nor composes PNG face patches in this mode.
+
+Speech frames are passed directly from FeatherTalk to one persistent hardware
+NVENC encoder through PyAV. No PNG or Base64 encoding occurs on this path.
+Native resolution, 25 FPS and the offline feature extraction below are retained.
+Video uses BT.709 limited-range YUV 4:2:0 H.264; this is visually configurable,
+not pixel-identical to the previous lossless RGB path. Default bitrate is 8 Mbit/s
+(`FEATHER_WEBRTC_BITRATE` in bits/second). Verify facial detail on the actual
+avatar/mobile before selecting a lower bitrate. This first version uses a fixed
+bitrate; it does not dynamically re-encode cached idle for congestion adaptation.
+
+The inferred lossless idle video is encoded once into a disk-backed H.264 access
+unit cache under `outputs/realtime-cache/idle-h264-*.ft264`. Cache identity includes
+the source file, rendering cache key, dimensions, bitrate, GOP and encoder library
+versions. Normal idle reads and sends compressed units without decoding, inference
+or encoding. RTP sequence numbers/timestamps are generated per connection.
+Speech starts with an IDR. After speech/cancellation, only the consecutive silent
+frames up to the next cached IDR are decoded and encoded as a short bridge.
+Decoder keyframe requests use the same bridge strategy without jumping phase.
+
+Rendering and transport queues are bounded. The backend reserves a future idle
+phase and prepares 12 speech frames ahead, or the whole reply when shorter.
+Insufficient throughput holds the last visible frame while silence continues;
+it cannot make inference below 25 FPS smooth. Cancellation discards unsent stale
+media. Media already queued in the network/browser cannot be withdrawn.
+
+The media image uses Ubuntu 24.04 (FFmpeg 6.x), because PyAV 12 requires
+FFmpeg 5 or newer. Rebuild it for GStreamer, libnice and NVENC-enabled PyAV:
+
+```bash
+docker compose up -d --build
+docker compose exec feathertalk python tools/check_webrtc_runtime.py
+```
+
+The runtime check exercises real NVENC encode/decode and GStreamer H.264/Opus
+offer creation with synthetic frames. It excludes avatar inference, a real ICE
+peer and mobile playback. Measure those separately. Model inference uses CUDA;
+NVENC uses the dedicated hardware encoder. PyAV color conversion and frame
+transfer still use CPU/system memory in this implementation.
+
+The main Compose file uses host networking for Linux Docker Engine. The
+container shares the host network namespace, so libnice can offer the server's
+LAN address directly. GStreamer/libnice uses host UDP ports 40000–40100;
+Docker port mappings are not needed:
+
+```bash
+docker compose config -q
+docker compose up -d --force-recreate feathertalk
+docker compose logs -f feathertalk
+```
+
+This uses the existing image; no image rebuild is needed for the networking
+change. Host TCP port 8000 must be available; allow
+UDP 40000–40100 from clients through the host firewall. Reconnect the browser
+and check for a server candidate on a client-reachable address and a WebRTC
+connection state of `connected`. Host networking does not remove an upstream
+router's NAT or replace TURN for clients that cannot establish a direct route.
+Docker host networking: <https://docs.docker.com/engine/network/drivers/host/>.
+
+Browser host candidates may use randomized `.local` names. The backend resolves
+these with `aioice` over mDNS before adding numeric candidates to GStreamer,
+including candidates embedded in the SDP answer. This requires client/server
+multicast reachability on UDP 5353 for those candidates; it does not require an
+Avahi daemon or NSS configuration in the image. Each lookup waits at most three
+seconds; an unresolved adapter is skipped so other candidates can still work.
+Look for `WebRTC mDNS resolved` or `WebRTC mDNS resolution failed` in server logs.
+If multicast is unavailable across the network, configure STUN/TURN to obtain
+reachable numeric candidates instead. GStreamer 1.24's candidate promise does
+not reliably confirm asynchronous hostname resolution, so it is not used here.
+
+For routed or Internet deployments, configure STUN/TURN as needed:
+
+- `FEATHER_WEBRTC_ICE_SERVERS`: browser JSON array of `{ "urls": ... }` objects,
+  with username/credential when using TURN.
+- `FEATHER_WEBRTC_STUN_SERVER`: GStreamer URI such as `stun://host:3478`.
+- `FEATHER_WEBRTC_TURN_SERVERS`: server JSON array of
+  `turn://username:password@host:3478` URIs; URI-encode credential characters.
+
+An existing TURN account can configure both peers using the same three variables
+as other applications. For example, put these in `.env` (replace the password):
+
+```dotenv
+TURN_SERVER_URLS="turns:turn.borndigital.ai:443?transport=tcp"
+TURN_SERVER_USERNAME=avatar
+TURN_SERVER_PASSWORD='replace-with-real-password'
+```
+
+`TURN_SERVER_URLS` accepts one URL or a JSON array of URLs. The backend appends
+this account to the browser ICE configuration and the GStreamer TURN servers;
+existing `FEATHER_WEBRTC_*` configuration remains supported. Credentials are
+automatically URI-escaped for GStreamer. Use single quotes around passwords in
+`.env` to preserve literal `$` characters. Browser ICE signaling includes the
+TURN credentials required by `RTCPeerConnection`; use an account intended for
+browser clients. STUN settings may remain configured alongside TURN.
+
+After deploying this code, rebuild once with `docker compose up -d --build`.
+Later `.env` changes only need `docker compose up -d --force-recreate`.
+Successful TURN allocation produces a candidate with `type=relay`; a connected
+media session still requires `WebRTC connection state: connected`.
+
+Use HTTPS outside localhost for browser microphone access. The current single
+active avatar restriction remains. Startup fails explicitly if GStreamer or
+NVENC is unavailable; no implicit software encoder fallback is used.
+Set `FEATHER_REALTIME_TRANSPORT=patches` and recreate the container to use the
+previous binary PNG player. The HTTP idle/background playback described below
+applies to that compatibility mode.
+
 The realtime voice bridge expects mono PCM16. It uses the sample rate declared
 by the server (including nested metadata) and remembers it for subsequent
 chunks. If no rate is declared, `REALTIME_SOURCE_SAMPLE_RATE` in `app.py` defaults
@@ -396,7 +507,13 @@ They also report cache hits/misses, process IDs, encoding time and video size.
 ffmpeg needs `libvpx-vp9`, and the browser must support RGB VP9/WebM.
 
 Speech sends only the generated face region as a lossless PNG, with its matching
-PCM audio. Speaking and inferred idle use the same decoded `silence.mp4`
+PCM audio. The browser negotiates `binary-v1` in its `ready` message: each binary
+WebSocket message contains a four-byte big-endian JSON metadata length, UTF-8
+metadata (including `png_bytes`), the PNG bytes, and mono PCM16 little-endian audio.
+Control/status messages remain JSON. Clients without this negotiation retain
+the original Base64 JSON frames. Binary delivery removes Base64 conversions and
+approximately 25% of the Base64 media size without changing pixels or samples.
+Speaking and inferred idle use the same decoded `silence.mp4`
 source pixels; speech backgrounds are served as lossless PNGs. The browser
 uses PNGs extracted once to `outputs/realtime-cache/source-<key>/`. Speech
 reads these independent images instead of seeking inside the MP4 for every
@@ -416,7 +533,11 @@ one frame from the last displayed speech frame, preserving the ping-pong phase
 and direction (except at the normal endpoint reversal). The hidden idle video
 seeks while speech is still playing, ready for the final audio deadline; if
 seeking is delayed, the last speech image remains visible until it completes.
-Both modes draw onto the same canvas, with identical scaling. A
+Both modes draw onto the same canvas, with identical scaling. Idle drawing uses
+`requestVideoFrameCallback` to mark new decoded video frames; display refreshes
+without a new frame do not copy the video again. Older browsers fall back to
+checking the 25 FPS video phase. Handoffs explicitly draw their target frame,
+and speech continues using the audio clock. A
 background producer renders ahead into 24 slots; playback acknowledgments bound
 the WebSocket delivery window to another 24 frames. Cancelling a conversation
 also stops scheduled audio and invalidates images still being decoded.

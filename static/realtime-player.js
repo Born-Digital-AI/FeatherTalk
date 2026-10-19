@@ -4,6 +4,23 @@ globalThis.AvatarPlayer = class AvatarPlayer {
   static idleBlobs = new Map();
   static backgroundImages = new Map();
 
+  static decodePacket(data) {
+    if (typeof data === "string") return JSON.parse(data);
+    if (!(data instanceof ArrayBuffer) || data.byteLength < 4) throw new Error("Invalid binary packet");
+    const headerSize = new DataView(data).getUint32(0);
+    const imageStart = 4 + headerSize;
+    if (!headerSize || imageStart > data.byteLength) throw new Error("Truncated packet header");
+    const frame = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(data, 4, headerSize)));
+    const imageSize = frame.png_bytes;
+    if (frame.type !== "frame" || !Number.isSafeInteger(imageSize) || imageSize <= 0 ||
+        imageSize > data.byteLength - imageStart || (data.byteLength - imageStart - imageSize) % 2) {
+      throw new Error("Invalid packet media lengths");
+    }
+    frame.image = new Blob([new Uint8Array(data, imageStart, imageSize)], { type: "image/png" });
+    frame.audio = new Uint8Array(data, imageStart + imageSize);
+    return frame;
+  }
+
   static idleStore(mode, key, blob) {
     if (typeof indexedDB === "undefined") return Promise.resolve(null);
     return new Promise(resolve => {
@@ -131,6 +148,14 @@ globalThis.AvatarPlayer = class AvatarPlayer {
       await this.idleVideo.play();
       if (epoch !== this.epoch || this.stopped) return;
       this.drawIdle();
+      if (typeof this.idleVideo.requestVideoFrameCallback === "function") {
+        const onFrame = () => {
+          if (this.stopped) return;
+          this.idleFrameDirty = true;
+          this.videoFrameCallback = this.idleVideo.requestVideoFrameCallback(onFrame);
+        };
+        this.videoFrameCallback = this.idleVideo.requestVideoFrameCallback(onFrame);
+      }
       this.setVisible(this.visible);
       this.onReady();
       this.raf = requestAnimationFrame(() => this.tick());
@@ -141,9 +166,14 @@ globalThis.AvatarPlayer = class AvatarPlayer {
 
   async decodeImage(url) {
     const image = new Image();
-    image.src = url;
-    await image.decode();
-    return image;
+    const objectUrl = typeof url === "string" ? null : URL.createObjectURL(url);
+    try {
+      image.src = objectUrl || url;
+      await image.decode();
+      return image;
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
   }
 
   background(url) {
@@ -178,13 +208,17 @@ globalThis.AvatarPlayer = class AvatarPlayer {
   }
 
   pcmBuffer(encoded) {
-    const raw = atob(encoded);
-    const bytes = new Uint8Array(raw.length);
-    for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index);
-    const pcm = new Int16Array(bytes.buffer);
-    const buffer = this.context.createBuffer(1, pcm.length, 16000);
+    let bytes = encoded;
+    if (typeof encoded === "string") {
+      const raw = atob(encoded);
+      bytes = new Uint8Array(raw.length);
+      for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index);
+    }
+    const pcm = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const samples = bytes.byteLength / 2;
+    const buffer = this.context.createBuffer(1, samples, 16000);
     const channel = buffer.getChannelData(0);
-    for (let index = 0; index < pcm.length; index++) channel[index] = pcm[index] / 32768;
+    for (let index = 0; index < samples; index++) channel[index] = pcm.getInt16(index * 2, true) / 32768;
     return buffer;
   }
 
@@ -280,8 +314,14 @@ globalThis.AvatarPlayer = class AvatarPlayer {
     }
   }
 
-  drawIdle() {
+  drawIdle(force = true) {
     if (!this.config || this.idleVideo.readyState < 2 || this.idleVideo.seeking) return;
+    const phase = Math.floor(this.idleVideo.currentTime * this.config.fps);
+    if (!force) {
+      if (this.videoFrameCallback != null ? !this.idleFrameDirty : this.lastIdlePhase === phase) return;
+    }
+    this.idleFrameDirty = false;
+    this.lastIdlePhase = phase;
     this.drawing.drawImage(this.idleVideo, 0, 0, this.canvas.width, this.canvas.height);
     const cycle = 2 * this.config.frame_count - 2;
     const sequence = Math.floor(this.idleVideo.currentTime * this.config.fps) % cycle;
@@ -385,7 +425,7 @@ globalThis.AvatarPlayer = class AvatarPlayer {
       // Decode the next idle frame while speech audio is still playing.
       if (finalFrame) this.prepareIdleSeek(finalFrame);
     }
-    if (!this.lastDisplayed && !this.returningIdle) this.drawIdle();
+    if (!this.lastDisplayed && !this.returningIdle) this.drawIdle(false);
     if (this.lastDisplayed?.utterance_end && now >= this.lastDisplayed.endTime && !this.scheduled.length && this.speaking && !this.returningIdle) {
       this.showIdle(this.lastDisplayed);
     }
@@ -412,6 +452,10 @@ globalThis.AvatarPlayer = class AvatarPlayer {
     this.abort.abort();
     this.resetSpeech(this.generation + 1);
     cancelAnimationFrame(this.raf);
+    if (this.videoFrameCallback != null) {
+      this.idleVideo.cancelVideoFrameCallback(this.videoFrameCallback);
+      this.videoFrameCallback = null;
+    }
     this.idleVideo.pause();
     this.idleVideo.removeAttribute("src");
     this.idleVideo.load();

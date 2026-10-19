@@ -1,5 +1,7 @@
 annotated-doc==0.0.5
 annotated-types==0.8.0
+aioice==0.10.1
+av==12.3.0
 anyio==4.14.2
 audioread==3.1.0
 beautifulsoup4==4.15.0

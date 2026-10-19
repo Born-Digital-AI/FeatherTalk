@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: feathertalk:cuda13
-    ports:
-      - "8000:8000"
+    # Linux host networking exposes reachable host interface addresses to WebRTC.
+    network_mode: host
     gpus:
       - driver: nvidia
         count: all
@@ -15,7 +15,16 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
       PYTHONUNBUFFERED: "1"
+      PYTHONFAULTHANDLER: "1"
       FEATHER_REALTIME_UNET_BATCH: ${FEATHER_REALTIME_UNET_BATCH:-1}
+      FEATHER_REALTIME_TRANSPORT: ${FEATHER_REALTIME_TRANSPORT:-webrtc}
+      FEATHER_WEBRTC_BITRATE: ${FEATHER_WEBRTC_BITRATE:-8000000}
+      FEATHER_WEBRTC_ICE_SERVERS: ${FEATHER_WEBRTC_ICE_SERVERS:-[]}
+      FEATHER_WEBRTC_STUN_SERVER: ${FEATHER_WEBRTC_STUN_SERVER:-}
+      FEATHER_WEBRTC_TURN_SERVERS: ${FEATHER_WEBRTC_TURN_SERVERS:-[]}
+      TURN_SERVER_URLS: ${TURN_SERVER_URLS:-}
+      TURN_SERVER_USERNAME: ${TURN_SERVER_USERNAME:-}
+      TURN_SERVER_PASSWORD: ${TURN_SERVER_PASSWORD:-}
     volumes:
       - ./audio:/app/audio
       - ./checkpoints:/app/checkpoints

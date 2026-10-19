@@ -357,6 +357,7 @@ INDEX_HTML = """
     </section>
   </main>
   <script src="/static/realtime-player.js"></script>
+  <script src="/static/webrtc-player.js"></script>
   <script>
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
@@ -411,6 +412,7 @@ INDEX_HTML = """
     let realtimePlayer = null;
     let serverReady = false;
     let idleReady = false;
+    let realtimeTransport = "patches";
     let currentFrame = null;
     let currentDirection = 1;
 
@@ -466,6 +468,7 @@ INDEX_HTML = """
     async function loadAvatars() {
       const response = await fetch("/api/avatars");
       const data = await response.json();
+      realtimeTransport = data.realtime_transport || "patches";
       avatar.replaceChildren();
       streamAvatar.replaceChildren();
       for (const name of data.avatars) {
@@ -493,6 +496,66 @@ INDEX_HTML = """
       streamFailed = false;
       streamStopRequested = false;
       stageError.classList.remove("active");
+      if (realtimeTransport === "webrtc") {
+        realtimePlayer = new NativeAvatarPlayer({
+          video: idleVideo,
+          send: message => {
+            if (streamWs?.readyState === WebSocket.OPEN) streamWs.send(JSON.stringify(message));
+          },
+          onReady: () => {
+            idleReady = true;
+            streamReady = serverReady;
+            hideStageLoader();
+            updateRealtimeButtons();
+          },
+          onError: showStreamError,
+          onStatus: setStreamStatus,
+        });
+        realtimePlayer.setVisible(document.querySelector("#realtimePanel").classList.contains("active"));
+        streamImage.style.display = "none";
+        video.style.display = "none";
+        showStageLoader("Preparing avatar stream...");
+        streamWs = new WebSocket(wsUrl(`/ws/media?avatar=${encodeURIComponent(streamAvatar.value)}`));
+        const mediaSocket = streamWs;
+        const mediaPlayer = realtimePlayer;
+        updateRealtimeButtons();
+        let signaling = Promise.resolve();
+        streamWs.addEventListener("open", () => { stopStream.disabled = false; });
+        streamWs.addEventListener("message", event => {
+          signaling = signaling.then(async () => {
+            if (streamWs !== mediaSocket || realtimePlayer !== mediaPlayer) return;
+            const message = JSON.parse(event.data);
+            if (message.type === "error") { showStreamError(message.message); return; }
+            if (message.type === "status") {
+              if (message.ready) {
+                serverReady = true;
+                streamReady = idleReady;
+                updateRealtimeButtons();
+              }
+              setStreamStatus(message.message);
+            } else if (message.type === "metrics") {
+              setStreamStatus(`Streaming ${message.media_mode}. Render: ${message.render_ms.toFixed(1)} ms/frame; queue: ${message.queued_frames} frames.`);
+            } else await mediaPlayer.handle(message);
+          }).catch(error => {
+            if (streamWs === mediaSocket && realtimePlayer === mediaPlayer) showStreamError(`Cannot prepare avatar media: ${error.message}`);
+          });
+        });
+        streamWs.addEventListener("error", () => showStreamError("Cannot connect to the avatar stream."));
+        streamWs.addEventListener("close", event => {
+          if (streamWs !== mediaSocket) return;
+          streamWs = null;
+          streamReady = false;
+          stopConversation.click();
+          clearPlayback();
+          stopStream.disabled = true;
+          updateRealtimeButtons();
+          if (!streamFailed) {
+            if (streamStopRequested) { hideStageLoader(); setStreamStatus("Stream stopped."); }
+            else showStreamError(`Avatar stream disconnected (WebSocket ${event.code}).`);
+          }
+        });
+        return;
+      }
       audioPlayerContext = audioPlayerContext || new AudioContext({ sampleRate: 16000 });
       if (audioPlayerContext.state === "suspended") audioPlayerContext.resume();
       realtimePlayer = new AvatarPlayer({
@@ -502,7 +565,9 @@ INDEX_HTML = """
           streamReady = serverReady && idleReady;
           hideStageLoader();
           updateRealtimeButtons();
-          if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.send(JSON.stringify({ type: "ready" }));
+          if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.send(JSON.stringify({
+            type: "ready", frame_transport: realtimePlayer.config.frame_transport,
+          }));
         },
         onError: showStreamError,
         onPlayed: (frame) => {
@@ -522,6 +587,7 @@ INDEX_HTML = """
       showStageLoader("Preparing avatar stream...");
       setStreamStatus("Starting avatar stream...");
       streamWs = new WebSocket(wsUrl(`/ws/stream?avatar=${encodeURIComponent(streamAvatar.value)}`));
+      streamWs.binaryType = "arraybuffer";
       updateRealtimeButtons();
       streamWs.addEventListener("open", () => {
         updateRealtimeButtons();
@@ -529,7 +595,13 @@ INDEX_HTML = """
         setStreamStatus("Preparing avatar stream...");
       });
       streamWs.addEventListener("message", (event) => {
-        const message = JSON.parse(event.data);
+        let message;
+        try {
+          message = AvatarPlayer.decodePacket(event.data);
+        } catch (error) {
+          showStreamError(`Cannot decode avatar packet: ${error.message}`);
+          return;
+        }
         if (message.type === "stream_init") {
           realtimePlayer.configure(message);
         } else if (message.type === "prepare_speech") {
@@ -921,13 +993,26 @@ def next_available_checkpoint() -> Path:
     raise FileNotFoundError("No avatar checkpoint found for ONNX export.")
 
 
-def _frame_data_url(img: np.ndarray) -> str:
+def _frame_png_bytes(img: np.ndarray) -> bytes:
     # Preserve the training image's resolution and pixels on the wire.
     ok, encoded = cv2.imencode(".png", img, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
     if not ok:
         raise RuntimeError("Failed to encode stream frame.")
-    payload = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return encoded.tobytes()
+
+
+def _frame_data_url(img: np.ndarray) -> str:
+    payload = base64.b64encode(_frame_png_bytes(img)).decode("ascii")
     return f"data:image/png;base64,{payload}"
+
+
+def _binary_frame_packet(packet: dict[str, Any]) -> bytes:
+    """binary-v1: uint32-BE JSON length, UTF-8 metadata, PNG, mono PCM16-LE."""
+    image, audio = packet["image"], packet["audio"]
+    metadata = {key: value for key, value in packet.items() if key not in ("image", "audio")}
+    metadata["png_bytes"] = len(image)
+    header = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return len(header).to_bytes(4, "big") + header + image + audio
 
 
 def _pcm16_to_base64(audio: np.ndarray) -> str:
@@ -1078,6 +1163,7 @@ class AvatarStream:
         self.idle_path = None
         self.timings = {"encoder_ms": 0.0, "render_ms": 0.0, "encode_ms": 0.0, "frames": 0, "patch_bytes": 0}
         self.offline_quality = offline_quality
+        self.binary_frames = False  # Negotiated once by the WebSocket client before rendering.
         self.local_idle = not cache_silence_frames
         self._prepare_avatar(avatar, offline_quality, cache_silence_frames)
         self.audio_lock = threading.Lock()
@@ -1428,6 +1514,17 @@ class AvatarStream:
             raise RuntimeError("Idle frames are played locally; render only prepared speech packets.")
         return _frame_data_url(image) if isinstance(image, np.ndarray) else image, audio
 
+    def next_video_packets(self, count=1, *, prepare=True):
+        """Full frames for NVENC: no PNG, Base64, crop or browser composition."""
+        generation = self.audio_generation
+        image, audio, ended = self._next_image(prepare=prepare)
+        if image is None or generation != self.audio_generation:
+            return []
+        if not isinstance(image, np.ndarray):
+            raise RuntimeError("WebRTC requires native full frames")
+        return [dict(image=image, audio=audio.astype("<i2").tobytes(), generation=generation,
+                     frame_index=self.current_frame, direction=self.current_direction, utterance_end=ended)]
+
     def next_patch_packet(self, *, prepare: bool = True) -> dict[str, Any] | None:
         generation = self.audio_generation
         image, audio, ended = self._next_image(prepare=prepare)
@@ -1444,12 +1541,15 @@ class AvatarStream:
         xmin, ymin = max(0, xmin), max(0, ymin)
         xmax, ymax = min(width, xmax), min(height, ymax)
         encoding_started = time.perf_counter()
-        patch_image = _frame_data_url(image[ymin:ymax, xmin:xmax])
+        binary = self.binary_frames
+        encode = _frame_png_bytes if binary else _frame_data_url
+        patch_image = encode(image[ymin:ymax, xmin:xmax])
         self.timings["encode_ms"] = (time.perf_counter() - encoding_started) * 1000
         self.timings["frames"] += 1
         self.timings["patch_bytes"] += len(patch_image)
         return {
-            "type": "frame", "image": patch_image, "audio": _pcm16_to_base64(audio),
+            "type": "frame", "image": patch_image,
+            "audio": audio.astype("<i2").tobytes() if binary else _pcm16_to_base64(audio),
             "duration": 1 / STREAM_FPS, "frame_index": frame_index,
             "direction": direction, "speaking": bool(np.any(audio)),
             "bbox": [xmin, ymin, xmax - xmin, ymax - ymin],
@@ -1505,8 +1605,8 @@ def index() -> str:
 
 
 @app.get("/api/avatars")
-def avatars() -> dict[str, list[str]]:
-    return {"avatars": list_avatars()}
+def avatars() -> dict[str, Any]:
+    return {"avatars": list_avatars(), "realtime_transport": os.environ.get("FEATHER_REALTIME_TRANSPORT", "webrtc")}
 
 
 @app.post("/api/upload")
@@ -1707,6 +1807,7 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             "frame_count": stream.silence_frame_count, "fps": STREAM_FPS,
             "width": stream.silence_size[1], "height": stream.silence_size[0],
             "generation": stream.audio_generation,
+            "frame_transport": "binary-v1",
         })
         stream_initialized = True
         stream.start_speech_preload()
@@ -1730,7 +1831,10 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
 
         async def send_message(message) -> None:
             async with send_lock:
-                await websocket.send_json(message)
+                if message.get("type") == "frame" and stream.binary_frames:
+                    await websocket.send_bytes(_binary_frame_packet(message))
+                else:
+                    await websocket.send_json(message)
 
         async def select_cursor(generation: int):
             while not client_idle.is_set():
@@ -1764,6 +1868,8 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             while True:
                 message = await websocket.receive_json()
                 if message.get("type") == "ready":
+                    if not client_ready.is_set():
+                        stream.binary_frames = message.get("frame_transport") == "binary-v1"
                     client_ready.set()
                     client_idle.set()
                 if message.get("type") == "idle" and message.get("generation") == stream.audio_generation:
@@ -1870,6 +1976,131 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
         if producer:
             await producer.close()
+        async with current_stream_lock:
+            if current_stream is stream:
+                current_stream = None
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
+@app.websocket("/ws/media")
+async def stream_media(websocket: WebSocket, avatar: str) -> None:
+    """Control-only WebSocket; complete video/audio travel over WebRTC."""
+    global current_stream
+    from gst_webrtc import BrowserIceResolver, GstTransport, ice_config, load_gstreamer
+    from webrtc_media import MediaSession, NvEncoder, VideoSettings, prepare_encoded_idle
+
+    await websocket.accept()
+    stream = session = cache = encoder = transport = None
+    tasks = []
+    preparation = None
+    browser_ice = None
+    loop = asyncio.get_running_loop()
+    events = asyncio.Queue(maxsize=256)
+
+    def notify(message):
+        def enqueue():
+            if events.full():
+                # Terminate instead of growing signaling indefinitely.
+                events.get_nowait()
+                events.put_nowait(dict(type="error", message="Avatar signaling queue overflowed."))
+            else:
+                events.put_nowait(message)
+        loop.call_soon_threadsafe(enqueue)
+
+    try:
+        if avatar not in list_avatars():
+            raise ValueError("Selected avatar does not exist.")
+        await asyncio.to_thread(load_gstreamer)  # Fail before expensive avatar preparation.
+        async with current_stream_lock:
+            if current_stream is not None:
+                raise RuntimeError("Another avatar stream is active. Stop it before starting a new stream.")
+            current_stream = await _prepare_avatar_stream(websocket, avatar)
+            stream = current_stream
+        stream.render_batch_frames = 1
+        stream.start_speech_preload()
+        settings = VideoSettings(stream.silence_size[1], stream.silence_size[0],
+                                 bitrate=int(os.environ.get("FEATHER_WEBRTC_BITRATE", "8000000")))
+        await websocket.send_json(dict(type="status", message="Preparing cached avatar video..."))
+        logger.info("WebRTC startup: preparing H.264 idle cache avatar=%s size=%sx%s", avatar,
+                    settings.width, settings.height)
+        preparation = asyncio.create_task(asyncio.to_thread(prepare_encoded_idle, stream.idle_path, settings))
+        while not preparation.done():
+            await asyncio.wait({preparation}, timeout=10)
+            if not preparation.done():
+                await websocket.send_json(dict(type="status", message="Preparing cached avatar video..."))
+        cache = preparation.result()
+        logger.info("WebRTC startup: H.264 idle cache ready avatar=%s frames=%s", avatar, len(cache))
+        encoder = NvEncoder(settings)
+        logger.info("WebRTC startup: speech encoder ready avatar=%s; creating transport", avatar)
+        transport = GstTransport(settings, notify)
+        browser_ice = BrowserIceResolver(transport)
+        logger.info("WebRTC startup: transport created avatar=%s; priming codec caps", avatar)
+        transport.prime(cache[0])
+        logger.info("WebRTC startup: codec caps ready avatar=%s; opening idle decoder", avatar)
+        session = MediaSession(stream, settings, transport, cache, encoder)
+        logger.info("WebRTC startup: media session ready avatar=%s", avatar)
+        await websocket.send_json(dict(type="media_init", ice_servers=ice_config(), width=settings.width,
+                                       height=settings.height, fps=settings.fps))
+        await websocket.send_json(dict(type="status", ready=True, message="Avatar media ready. Connecting video..."))
+        transport.offer()
+
+        async def controls():
+            while True:
+                message = await websocket.receive_json()
+                if message.get("type") == "answer":
+                    await browser_ice.apply_answer(message.get("sdp"))
+                elif message.get("type") == "ice":
+                    await browser_ice.add(message.get("candidate"))
+                elif message.get("type") == "stop":
+                    return
+
+        async def signals():
+            while True:
+                message = await events.get()
+                if message.get("type") == "connection":
+                    if message["state"] == "connected":
+                        session.connected.set()
+                    elif message["state"] in ("failed", "closed"):
+                        raise RuntimeError("Avatar WebRTC connection failed.")
+                    continue
+                await websocket.send_json(message)
+                if message.get("type") == "error":
+                    raise RuntimeError(message["message"])
+
+        await session.start()
+        tasks = [asyncio.create_task(controls()), asyncio.create_task(signals()), *session.tasks]
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.exception("Avatar WebRTC stream failed: avatar=%s", avatar)
+        with contextlib.suppress(Exception):
+            await websocket.send_json(dict(type="error", message=str(exc)))
+    finally:
+        # Drain preparation before removing its owner, even after a disconnect.
+        if preparation is not None and not preparation.done():
+            with contextlib.suppress(Exception):
+                cache = await asyncio.shield(preparation)
+        elif preparation is not None and cache is None and not preparation.cancelled():
+            with contextlib.suppress(Exception):
+                cache = preparation.result()
+        for task in tasks:
+            task.cancel()
+        if session:
+            await session.close()
+        else:
+            for resource in (transport, encoder, cache):
+                if resource:
+                    resource.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if browser_ice is not None:
+            try:
+                await browser_ice.close()
+            except Exception:
+                logger.exception("WebRTC mDNS cleanup failed: avatar=%s", avatar)
         async with current_stream_lock:
             if current_stream is stream:
                 current_stream = None

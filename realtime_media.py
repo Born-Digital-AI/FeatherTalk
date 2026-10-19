@@ -340,9 +340,10 @@ def _encode_idle_frames(images, fps: float, output: Path) -> None:
 class SpeechProducer:
     """One owner of model state; rendering runs ahead without blocking delivery."""
 
-    def __init__(self, stream: Any, capacity: int = 24, select_cursor=None):
+    def __init__(self, stream: Any, capacity: int = 24, select_cursor=None, render_packets=None):
         self.stream = stream
         self.select_cursor = select_cursor
+        self.render_packets = render_packets or stream.next_patch_packets
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=capacity)
         self.task: asyncio.Task | None = None
         self.error: Exception | None = None
@@ -391,7 +392,7 @@ class SpeechProducer:
                     self._reservation = reservation
                     self._needs_cursor = False
                 count = min(self.queue.maxsize - self.queue.qsize(), getattr(self.stream, "render_batch_frames", 1))
-                packets = await self._in_thread(self.stream.next_patch_packets, count, prepare=False)
+                packets = await self._in_thread(self.render_packets, count, prepare=False)
                 if packets and getattr(self, "_reservation", None):
                     packets[0]["playback_start"] = self._reservation["playback_start"]
                     self._reservation = None
