@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -61,6 +62,16 @@ _AVATAR_PREPARATION_LOCK = threading.Lock()
 _SPEECH_MODEL_LOCK = threading.Lock()
 _SPEECH_PRELOAD_LOCK = threading.Lock()
 _SPEECH_PRELOAD_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="avatar-model-load")
+
+UPLOADS_DIR = ROOT_DIR / "uploads"
+TRAINING_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm", ".mkv"}
+AVATAR_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9]*$")
+
+_training_queue_list: list[dict] = []  # protected by _training_state_lock
+_training_queue: queue.Queue = queue.Queue()
+_current_training: dict | None = None
+_training_state_lock = threading.Lock()
+_training_worker_thread: threading.Thread | None = None
 
 
 INDEX_HTML = """
@@ -125,6 +136,8 @@ INDEX_HTML = """
     }
     select,
     input[type="tel"],
+    input[type="text"],
+    input[type="email"],
     input[type="file"],
     button,
     textarea {
@@ -136,6 +149,8 @@ INDEX_HTML = """
     }
     select,
     input[type="tel"],
+    input[type="text"],
+    input[type="email"],
     input[type="file"],
     button {
       min-height: 38px;
@@ -184,8 +199,40 @@ INDEX_HTML = """
       background: #26313d;
       color: #ffffff;
     }
+    .mode-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    .mode-tab {
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid #384150;
+      border-radius: 6px;
+      background: #10141a;
+      color: #a7afbd;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .mode-tab.active {
+      border-color: #2f8a66;
+      background: #1a3328;
+      color: #ffffff;
+    }
+    .mode-panel { display: none; }
+    .mode-panel.active { display: contents; }
     .panel { display: none; }
     .panel.active { display: block; }
+    .name-hint {
+      font-size: 12px;
+      min-height: 16px;
+      margin-top: -4px;
+    }
+    .name-hint.valid { color: #2f8a66; }
+    .name-hint.invalid { color: #e05c55; }
+    .name-hint.checking { color: #737c8c; }
     .stage {
       display: grid;
       place-items: center;
@@ -294,6 +341,11 @@ INDEX_HTML = """
       <div class="brand">
         <h1>FeatherTalk</h1>
       </div>
+      <div class="mode-tabs">
+        <button class="mode-tab active" type="button" data-mode="test">Test</button>
+        <button class="mode-tab" type="button" data-mode="train">Train</button>
+      </div>
+      <div id="testMode" class="mode-panel active">
       <div class="tabs">
         <button class="tab active" type="button" data-panel="realtimePanel">Realtime</button>
         <button class="tab" type="button" data-panel="offlinePanel">Offline</button>
@@ -335,12 +387,39 @@ INDEX_HTML = """
           </label>
         </form>
       </section>
+      </div>
+      <div id="trainMode" class="mode-panel">
+      <section id="trainingPanel" class="panel active">
+        <form id="trainingForm">
+          <label>
+            Avatar name
+            <input id="trainingAvatarName" name="trainingAvatarName" type="text" placeholder="e.g. alice1" autocomplete="off" spellcheck="false">
+            <span id="avatarNameHint" class="name-hint"></span>
+          </label>
+          <label>
+            Training video
+            <span style="display:block;color:#737c8c;font-size:12px;font-weight:400;margin-bottom:2px;">Upload a 2-minute video of silent avatar with minimal hand gestures.</span>
+            <input id="trainingVideo" name="trainingVideo" type="file" accept="video/mp4,video/avi,video/quicktime,video/webm,.mp4,.avi,.mov,.webm">
+          </label>
+          <label>
+            Notification email
+            <input id="trainingEmail" name="trainingEmail" type="email" placeholder="you@example.com" autocomplete="email">
+          </label>
+          <button id="startTraining" type="submit" disabled>Start training</button>
+          <label>
+            Status
+            <textarea id="trainingStatus" readonly>Enter an avatar name, upload a training video, and provide your email.</textarea>
+          </label>
+        </form>
+      </section>
+      </div>
     </aside>
     <section class="stage">
       <div class="stage-inner">
         <video id="idleVideo" muted playsinline loop aria-label="Idle avatar"></video>
         <canvas id="streamImage" aria-label="Realtime avatar stream"></canvas>
         <video id="video" controls></video>
+        <video id="trainingPreview" controls></video>
         <div id="stageError" class="stage-error" role="alert">
           <div class="stage-error-content">
             <h2>Realtime streaming cannot start</h2>
@@ -362,18 +441,51 @@ INDEX_HTML = """
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
         document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-        document.querySelectorAll(".panel").forEach((item) => item.classList.remove("active"));
+        document.querySelectorAll("#testMode .panel").forEach((item) => item.classList.remove("active"));
         tab.classList.add("active");
         document.getElementById(tab.dataset.panel).classList.add("active");
         if (tab.dataset.panel === "realtimePanel") {
           video.style.display = "none";
+          trainingPreview.style.display = "none";
           if (realtimePlayer) realtimePlayer.setVisible(true);
           if (streamFailed) stageError.classList.add("active");
         }
         if (tab.dataset.panel === "offlinePanel") {
           streamImage.style.display = "none";
+          trainingPreview.style.display = "none";
           if (realtimePlayer) realtimePlayer.setVisible(false);
           stageError.classList.remove("active");
+        }
+      });
+    });
+
+    document.querySelectorAll(".mode-tab").forEach((modeTab) => {
+      modeTab.addEventListener("click", () => {
+        document.querySelectorAll(".mode-tab").forEach((t) => t.classList.remove("active"));
+        document.querySelectorAll(".mode-panel").forEach((p) => p.classList.remove("active"));
+        modeTab.classList.add("active");
+        document.getElementById(modeTab.dataset.mode === "test" ? "testMode" : "trainMode").classList.add("active");
+        if (modeTab.dataset.mode === "test") {
+          trainingPreview.style.display = "none";
+          clearInterval(trainingStatusPoller);
+          trainingStatusPoller = null;
+          const activeTab = document.querySelector(".tab.active");
+          if (activeTab?.dataset.panel === "realtimePanel") {
+            if (realtimePlayer) realtimePlayer.setVisible(true);
+            if (streamFailed) stageError.classList.add("active");
+          } else {
+            if (realtimePlayer) realtimePlayer.setVisible(false);
+          }
+        }
+        if (modeTab.dataset.mode === "train") {
+          streamImage.style.display = "none";
+          video.style.display = "none";
+          if (realtimePlayer) realtimePlayer.setVisible(false);
+          stageError.classList.remove("active");
+          if (uploadedTrainingVideoPath) trainingPreview.style.display = "block";
+          pollTrainingStatus();
+          clearInterval(trainingStatusPoller);
+          trainingStatusPoller = setInterval(pollTrainingStatus, 5000);
         }
       });
     });
@@ -397,6 +509,14 @@ INDEX_HTML = """
     const stageLoaderText = document.querySelector("#stageLoaderText");
     const stageError = document.querySelector("#stageError");
     const stageErrorText = document.querySelector("#stageErrorText");
+    const trainingForm = document.querySelector("#trainingForm");
+    const trainingAvatarName = document.querySelector("#trainingAvatarName");
+    const avatarNameHint = document.querySelector("#avatarNameHint");
+    const trainingVideo = document.querySelector("#trainingVideo");
+    const trainingPreview = document.querySelector("#trainingPreview");
+    const trainingEmail = document.querySelector("#trainingEmail");
+    const startTraining = document.querySelector("#startTraining");
+    const trainingStatusBox = document.querySelector("#trainingStatus");
 
     let uploadedAudioPath = null;
     let streamWs = null;
@@ -415,6 +535,10 @@ INDEX_HTML = """
     let realtimeTransport = "patches";
     let currentFrame = null;
     let currentDirection = 1;
+    let uploadedTrainingVideoPath = null;
+    let trainingAvatarNameValid = false;
+    let nameCheckTimer = null;
+    let trainingStatusPoller = null;
 
     function setStatus(value) {
       statusBox.value = value;
@@ -804,6 +928,123 @@ INDEX_HTML = """
         hideStageLoader();
       } else {
         hideStageLoader();
+      }
+    });
+
+    function setTrainingStatus(value) {
+      trainingStatusBox.value = value;
+    }
+
+    function updateTrainingButton() {
+      const emailValid = trainingEmail.value.trim().length > 0 && trainingEmail.checkValidity();
+      startTraining.disabled = !trainingAvatarNameValid || !uploadedTrainingVideoPath || !emailValid;
+    }
+
+    function setNameHint(state, message) {
+      avatarNameHint.textContent = message;
+      avatarNameHint.className = "name-hint" + (state ? " " + state : "");
+      trainingAvatarNameValid = state === "valid";
+      updateTrainingButton();
+    }
+
+    async function pollTrainingStatus() {
+      try {
+        const res = await fetch("/api/training-status");
+        const data = await res.json();
+        if (data.current) {
+          const elapsed = Math.floor(data.current.elapsed_s);
+          const mins = Math.floor(elapsed / 60);
+          const secs = elapsed % 60;
+          const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+          const queueLen = data.queue.length;
+          let msg = `Training '${data.current.avatar}' in progress (${timeStr} elapsed).`;
+          if (queueLen > 0) msg += ` ${queueLen} more job(s) queued.`;
+          setTrainingStatus(msg);
+        } else if (data.queue.length > 0) {
+          setTrainingStatus(`${data.queue.length} job(s) queued. Starting soon...`);
+        }
+      } catch {}
+    }
+
+    trainingAvatarName.addEventListener("input", () => {
+      const name = trainingAvatarName.value.trim();
+      clearTimeout(nameCheckTimer);
+      if (!name) { setNameHint("", ""); return; }
+      if (!/^[a-zA-Z][a-zA-Z0-9]*$/.test(name)) {
+        setNameHint("invalid", "Must start with a letter. Letters and numbers only, no spaces.");
+        return;
+      }
+      setNameHint("checking", "Checking availability...");
+      nameCheckTimer = setTimeout(async () => {
+        try {
+          const res = await fetch(`/api/check-avatar-name?name=${encodeURIComponent(name)}`);
+          const data = await res.json();
+          setNameHint(data.available ? "valid" : "invalid", data.available ? "Name is available." : (data.reason || "Name is not available."));
+        } catch {
+          setNameHint("", "Could not check name availability.");
+        }
+      }, 500);
+    });
+
+    trainingVideo.addEventListener("change", async () => {
+      uploadedTrainingVideoPath = null;
+      trainingPreview.style.display = "none";
+      trainingPreview.src = "";
+      updateTrainingButton();
+      if (!trainingVideo.files.length) return;
+      const body = new FormData();
+      body.append("video", trainingVideo.files[0]);
+      setTrainingStatus("Uploading training video...");
+      try {
+        const res = await fetch("/api/upload-training-video", { method: "POST", body });
+        const data = await res.json();
+        if (!res.ok) { setTrainingStatus(data.detail || "Upload failed."); return; }
+        uploadedTrainingVideoPath = data.video_path;
+        setTrainingStatus(data.message || "Video uploaded.");
+        if (document.querySelector("#trainMode").classList.contains("active")) {
+          trainingPreview.src = data.preview_url;
+          trainingPreview.style.display = "block";
+        }
+      } catch (e) {
+        setTrainingStatus("Upload error: " + e.message);
+      }
+      updateTrainingButton();
+    });
+
+    trainingEmail.addEventListener("input", updateTrainingButton);
+
+    trainingForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!uploadedTrainingVideoPath || !trainingAvatarNameValid) return;
+      const email = trainingEmail.value.trim();
+      if (!email) return;
+      startTraining.disabled = true;
+      setTrainingStatus("Submitting training job...");
+      const body = new FormData();
+      body.append("avatar_name", trainingAvatarName.value.trim());
+      body.append("video_path", uploadedTrainingVideoPath);
+      body.append("email", email);
+      try {
+        const res = await fetch("/api/train", { method: "POST", body });
+        const data = await res.json();
+        if (!res.ok) {
+          setTrainingStatus(data.detail || "Failed to start training.");
+          startTraining.disabled = false;
+          return;
+        }
+        setTrainingStatus(data.message);
+        trainingVideo.value = "";
+        uploadedTrainingVideoPath = null;
+        trainingPreview.style.display = "none";
+        trainingPreview.src = "";
+        setNameHint("", "");
+        trainingAvatarName.value = "";
+        trainingEmail.value = "";
+        updateTrainingButton();
+        pollTrainingStatus();
+      } catch (e) {
+        setTrainingStatus("Error: " + e.message);
+        startTraining.disabled = false;
       }
     });
 
@@ -2212,6 +2453,172 @@ async def conversation_bridge(websocket: WebSocket) -> None:
         stream.clear_audio()
         with contextlib.suppress(Exception):
             await websocket.close()
+
+
+def _training_worker() -> None:
+    global _current_training
+    while True:
+        job = _training_queue.get()
+        try:
+            with _training_state_lock:
+                _current_training = {**job, "started_at": time.time()}
+            proc = subprocess.Popen(
+                [
+                    sys.executable, str(ROOT_DIR / "train_pipeline.py"),
+                    "--avatar", job["avatar"],
+                    "--video", job["video"],
+                    "--email", job["email"],
+                ],
+            )
+            proc.wait()
+        except Exception:
+            logger.exception("Training worker error: avatar=%s", job.get("avatar"))
+        finally:
+            with _training_state_lock:
+                _current_training = None
+                if _training_queue_list and _training_queue_list[0].get("avatar") == job.get("avatar"):
+                    _training_queue_list.pop(0)
+            _training_queue.task_done()
+
+
+def _ensure_training_worker() -> None:
+    global _training_worker_thread
+    with _training_state_lock:
+        if _training_worker_thread is None or not _training_worker_thread.is_alive():
+            _training_worker_thread = threading.Thread(
+                target=_training_worker, daemon=True, name="training-worker"
+            )
+            _training_worker_thread.start()
+
+
+@app.get("/api/check-avatar-name")
+def check_avatar_name(name: str) -> dict[str, Any]:
+    if not AVATAR_NAME_RE.match(name):
+        return {"available": False, "reason": "Name must start with a letter and contain only letters and numbers (no spaces)."}
+    if (DATA_DIR / name).exists():
+        return {"available": False, "reason": f"Avatar '{name}' already exists."}
+    return {"available": True, "reason": ""}
+
+
+@app.post("/api/upload-training-video")
+async def upload_training_video(video: UploadFile = File(...)) -> dict[str, str]:
+    filename = _safe_filename(video.filename or "")
+    extension = Path(filename).suffix.lower()
+    if extension not in TRAINING_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported video format. Allowed: {', '.join(sorted(TRAINING_VIDEO_EXTENSIONS))}")
+    if not filename:
+        raise HTTPException(status_code=400, detail="The uploaded file does not have a usable name.")
+    UPLOADS_DIR.mkdir(exist_ok=True)
+    unique_name = f"{uuid.uuid4().hex}_{filename}"
+    target_path = UPLOADS_DIR / unique_name
+    with target_path.open("wb") as f:
+        shutil.copyfileobj(video.file, f)
+    return {
+        "video_path": _relative(target_path),
+        "preview_url": f"/uploads/{unique_name}",
+        "message": f"Video uploaded: {filename}",
+    }
+
+
+@app.get("/uploads/{filename}")
+def serve_upload(filename: str, request: Request):
+    safe = _safe_filename(filename)
+    if safe != filename:
+        raise HTTPException(status_code=404, detail="Not found.")
+    path = UPLOADS_DIR / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found.")
+    extension = path.suffix.lower()
+    media_types = {".mp4": "video/mp4", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
+                   ".webm": "video/webm", ".mkv": "video/x-matroska"}
+    media_type = media_types.get(extension, "application/octet-stream")
+    size = path.stat().st_size
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+    start, end, status = 0, size - 1, 200
+    byte_range = request.headers.get("range")
+    if byte_range:
+        try:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", byte_range)
+            if match is None or not any(match.groups()):
+                raise ValueError
+            left, right = match.groups()
+            if left:
+                start = int(left)
+                end = min(int(right), size - 1) if right else size - 1
+            else:
+                if int(right) <= 0:
+                    raise ValueError
+                start = max(0, size - int(right))
+            if not 0 <= start <= end < size:
+                raise ValueError
+        except ValueError:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+        status = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers["Content-Length"] = str(max(0, end - start + 1))
+
+    def chunks():
+        with path.open("rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(chunks(), status_code=status, media_type=media_type, headers=headers)
+
+
+@app.get("/api/training-status")
+def training_status() -> dict[str, Any]:
+    with _training_state_lock:
+        current = None
+        if _current_training is not None:
+            elapsed = time.time() - _current_training.get("started_at", time.time())
+            current = {
+                "avatar": _current_training["avatar"],
+                "email": _current_training["email"],
+                "elapsed_s": int(elapsed),
+            }
+        with _training_queue.mutex:
+            queued_snapshot = list(_training_queue.queue)
+        queue_info = [{"avatar": j["avatar"], "email": j["email"]} for j in queued_snapshot]
+    return {"current": current, "queue": queue_info}
+
+
+@app.post("/api/train")
+def start_training(
+    avatar_name: str = Form(...),
+    video_path: str = Form(...),
+    email: str = Form(...),
+) -> dict[str, str]:
+    if not AVATAR_NAME_RE.match(avatar_name):
+        raise HTTPException(status_code=400, detail="Invalid avatar name.")
+    if (DATA_DIR / avatar_name).exists():
+        raise HTTPException(status_code=400, detail=f"Avatar '{avatar_name}' already exists.")
+
+    resolved_video = (ROOT_DIR / video_path).resolve() if not Path(video_path).is_absolute() else Path(video_path).resolve()
+    try:
+        resolved_video.relative_to(UPLOADS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video path.")
+    if not resolved_video.exists():
+        raise HTTPException(status_code=400, detail="Uploaded video file not found.")
+
+    job = {"avatar": avatar_name, "video": str(resolved_video), "email": email}
+    with _training_state_lock:
+        _training_queue_list.append({"avatar": avatar_name, "email": email})
+    _training_queue.put(job)
+    _ensure_training_worker()
+
+    return {
+        "message": (
+            f"Training for avatar '{avatar_name}' has been queued. "
+            f"You will receive an email notification at {email} when it completes."
+        )
+    }
 
 
 if __name__ == "__main__":

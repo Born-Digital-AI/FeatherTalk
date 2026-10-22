@@ -25,9 +25,15 @@ services:
       TURN_SERVER_URLS: ${TURN_SERVER_URLS:-}
       TURN_SERVER_USERNAME: ${TURN_SERVER_USERNAME:-}
       TURN_SERVER_PASSWORD: ${TURN_SERVER_PASSWORD:-}
+      CONDA_BASE: ${CONDA_BASE:-/home/ultimate/miniconda3}
+      TBDUB_CONDA_ENV: ${TBDUB_CONDA_ENV:-tbdub}
     volumes:
       - ./audio:/app/audio
       - ./checkpoints:/app/checkpoints
       - ./data:/app/data
       - ./outputs:/app/outputs
+      - ./uploads:/app/uploads
+      - /opt/digital-human/TBDub:/opt/digital-human/TBDub
+      - ${CONDA_BASE:-/home/ultimate/miniconda3}:${CONDA_BASE:-/home/ultimate/miniconda3}:ro
+    shm_size: '8gb'
     restart: unless-stopped
