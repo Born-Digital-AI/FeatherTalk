@@ -1,6 +1,0 @@
-# Linux Docker Engine: use host interface addresses for WebRTC ICE candidates.
-# docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --force-recreate
-services:
-  feathertalk:
-    network_mode: host
-    ports: !reset []
