@@ -398,7 +398,7 @@ INDEX_HTML = """
           </label>
           <label>
             Training video
-            <span style="display:block;color:#737c8c;font-size:12px;font-weight:400;margin-bottom:2px;">Upload a 2-minute video of silent avatar with minimal hand gestures.</span>
+            <span style="display:block;color:#737c8c;font-size:12px;font-weight:400;margin-bottom:2px;">Upload a 2-minute video of silent avatar with minimal hand gestures. Video must be 25 FPS.</span>
             <input id="trainingVideo" name="trainingVideo" type="file" accept="video/mp4,video/avi,video/quicktime,video/webm,.mp4,.avi,.mov,.webm">
           </label>
           <label>
