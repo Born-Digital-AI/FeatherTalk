@@ -450,13 +450,14 @@ appearance. The clip must match the avatar source dimensions, frame count and
 `outputs/realtime-cache/`, without chroma subsampling or intermediate PNGs.
 The reverse leg comes directly from cached frames, avoiding a second loop buffer
 in ffmpeg. Inferred frames are spooled losslessly to temporary disk storage;
-only two decoded frames are retained at a time. The completed WebM remains in
-RAM, and the idle endpoint serves it without rendering or encoding again.
+only two decoded frames are retained at a time. The completed WebM is kept only
+on disk; the idle endpoints stream it from there without rendering or encoding
+again. If the file is deleted, the next stream start renders it again.
 Training JPEG/PNG images load lazily with an eight-frame cache; the source silent
 video is decoded sequentially with a two-frame cache. Native resolution and
 pixels are preserved without holding three complete raw videos in memory.
-After server restart, the existing inferred WebM is read into RAM and decoded
-frames are accessed lazily without repeating inference or encoding. Asset changes are checked
+After server restart, the existing inferred WebM is reused from disk without
+repeating inference or encoding. Asset changes are checked
 with a directory metadata scan. Changing the silent clip, avatar images/landmarks,
 UNet or audio encoder invalidates the inferred cache.
 
@@ -575,8 +576,11 @@ Only after checking the reported pixel differences and speed, set
 fixed-batch older exports retain batch 1. Batching and I/O binding use FP32;
 batch convolution algorithms can still produce small numerical differences.
 
-For lower latency, callers can explicitly construct
-`AvatarStream(avatar, offline_quality=False)`. This uses the existing ONNX encoder,
+For lower latency, choose **Lip-sync mode → Streaming** in the Realtime panel
+(`offline_quality=false` query parameter on `/ws/stream` and `/ws/media`). The
+first start of an avatar prepares both modes on disk: ONNX exports (FeatherHuBERT
+goes to `outputs/realtime-cache/featherhubert/`) and one idle WebM per mode.
+Only the requested mode stays loaded in memory. Streaming mode uses the ONNX encoder,
 320 ms batches, 320 ms lookahead and up to 2 seconds of waveform history. Tune
 `REALTIME_BATCH_FRAMES`, `REALTIME_LOOKAHEAD_FRAMES`, `AUDIO_TAIL_TIMEOUT` and
 `FEATHER_REALTIME_HISTORY_SAMPLES` for that path. Its features cannot match

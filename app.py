@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from dihuman_run import DiHumanProcessor, FEATHER_REALTIME_HISTORY_SAMPLES, FRAME_LEN, SAMPLE_RATE
-from realtime_media import SpeechProducer, idle_dependency_signature, load_silent_clip, prepare_inferred_idle_loop, read_idle_video
+from realtime_media import SpeechProducer, idle_dependency_signature, load_silent_clip, prepare_inferred_idle_loop
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -43,7 +43,7 @@ FEATHER_HUBERT_SCRIPT = ROOT_DIR / "data_utils" / "feather_hubert" / "feather_hu
 FEATHER_HUBERT_CHECKPOINT = (
     ROOT_DIR / "assets" / "featherhubert" / "feather_hubert_188_latest_99.pth"
 )
-FEATHER_HUBERT_ONNX = ROOT_DIR / "assets" / "featherhubert" / "feather_hubert.onnx"
+FEATHER_HUBERT_ONNX = OUTPUTS_DIR / "realtime-cache" / "featherhubert" / "feather_hubert.onnx"
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav"}
 REALTIME_VOICE_WS_URL = "wss://internal-test.borndigital.ai/realtime-voice-control/ws"
 PLAYBACK_CHUNK_FRAMES = 4
@@ -233,6 +233,10 @@ INDEX_HTML = """
     .name-hint.valid { color: #2f8a66; }
     .name-hint.invalid { color: #e05c55; }
     .name-hint.checking { color: #737c8c; }
+    .field-hint {
+      font-size: 12px;
+      color: #737c8c;
+    }
     .stage {
       display: grid;
       place-items: center;
@@ -355,6 +359,14 @@ INDEX_HTML = """
           <label>
             Avatar
             <select id="streamAvatar" name="streamAvatar"></select>
+          </label>
+          <label>
+            Lip-sync mode
+            <select id="lipSyncMode" name="lipSyncMode">
+              <option value="true">Full reply (accurate, higher latency)</option>
+              <option value="false">Streaming (low latency)</option>
+            </select>
+            <span id="lipSyncHint" class="field-hint"></span>
           </label>
           <label>
             Phone number
@@ -497,6 +509,8 @@ INDEX_HTML = """
     const form = document.querySelector("#form");
     const statusBox = document.querySelector("#status");
     const video = document.querySelector("#video");
+    const lipSyncMode = document.querySelector("#lipSyncMode");
+    const lipSyncHint = document.querySelector("#lipSyncHint");
     const phoneNumber = document.querySelector("#phoneNumber");
     const startStream = document.querySelector("#startStream");
     const stopStream = document.querySelector("#stopStream");
@@ -586,6 +600,7 @@ INDEX_HTML = """
     function updateRealtimeButtons() {
       const phoneNumberFilled = hasPhoneNumber();
       startStream.disabled = !phoneNumberFilled || !!streamWs;
+      lipSyncMode.disabled = !!streamWs;
       startConversation.disabled = !phoneNumberFilled || !streamReady || !!conversationWs;
     }
 
@@ -613,6 +628,20 @@ INDEX_HTML = """
       return `${scheme}//${window.location.host}${path}`;
     }
 
+    function streamQuery() {
+      return `avatar=${encodeURIComponent(streamAvatar.value)}&offline_quality=${lipSyncMode.value}`;
+    }
+
+    const lipSyncHints = {
+      true: "Waits for the whole audio reply, then renders it at once. Most accurate lips; the avatar starts speaking only after the reply is complete.",
+      false: "Renders in 320 ms chunks with 320 ms lookahead, starting after ~640 ms of audio. Lower latency, slightly less accurate lips.",
+    };
+    function updateLipSyncHint() {
+      lipSyncHint.textContent = lipSyncHints[lipSyncMode.value] || "";
+    }
+    lipSyncMode.addEventListener("change", updateLipSyncHint);
+    updateLipSyncHint();
+
     startStream.addEventListener("click", () => {
       if (streamWs) return;
       clearPlayback();
@@ -639,7 +668,7 @@ INDEX_HTML = """
         streamImage.style.display = "none";
         video.style.display = "none";
         showStageLoader("Preparing avatar stream...");
-        streamWs = new WebSocket(wsUrl(`/ws/media?avatar=${encodeURIComponent(streamAvatar.value)}`));
+        streamWs = new WebSocket(wsUrl(`/ws/media?${streamQuery()}`));
         const mediaSocket = streamWs;
         const mediaPlayer = realtimePlayer;
         updateRealtimeButtons();
@@ -710,7 +739,7 @@ INDEX_HTML = """
       video.style.display = "none";
       showStageLoader("Preparing avatar stream...");
       setStreamStatus("Starting avatar stream...");
-      streamWs = new WebSocket(wsUrl(`/ws/stream?avatar=${encodeURIComponent(streamAvatar.value)}`));
+      streamWs = new WebSocket(wsUrl(`/ws/stream?${streamQuery()}`));
       streamWs.binaryType = "arraybuffer";
       updateRealtimeButtons();
       streamWs.addEventListener("open", () => {
@@ -1444,7 +1473,7 @@ class AvatarStream:
             key = (str((DATA_DIR / avatar).resolve()), offline_quality)
             signature = idle_dependency_signature(self._idle_dependencies())
             cached = _PREPARED_AVATARS.get(key)
-            if cached is not None and cached[0] == signature:
+            if cached is not None and cached[0] == signature and cached[1]["idle_path"].is_file():
                 resources = cached[1]
                 for name in ("processor", "silence_frame_count", "silence_size", "idle_path"):
                     setattr(self, name, resources[name])
@@ -1468,6 +1497,7 @@ class AvatarStream:
             resources["render_ms"] = self.timings["render_ms"]
             _PREPARED_AVATARS[key] = (signature, resources)
             logger.info("Avatar %s prepared in %.2fs", avatar, time.perf_counter() - started)
+        _prepare_disk_cache(avatar, not offline_quality)
 
     def _load_avatar(self, avatar, offline_quality, cache_silence_frames):
         silence_path = DATA_DIR / avatar / "silence.mp4"
@@ -1832,6 +1862,25 @@ class AvatarStream:
         return packets
 
 
+def _prepare_disk_cache(avatar: str, offline_quality: bool) -> None:
+    """Put the other lip-sync mode's ONNX exports and idle video on disk, not in RAM."""
+    key = (str((DATA_DIR / avatar).resolve()), offline_quality)
+    if key in _PREPARED_AVATARS:
+        return
+    started = time.perf_counter()
+    try:
+        AvatarStream(avatar, offline_quality=offline_quality, cache_silence_frames=False)
+    except Exception:
+        # The requested mode is ready; a failed export must not block its stream.
+        logger.exception("Disk cache preparation failed: avatar=%s offline_quality=%s", avatar, offline_quality)
+        return
+    finally:
+        with _AVATAR_PREPARATION_LOCK:
+            _PREPARED_AVATARS.pop(key, None)
+    logger.info("Disk cache ready: avatar=%s offline_quality=%s in %.2fs",
+                avatar, offline_quality, time.perf_counter() - started)
+
+
 current_stream: AvatarStream | None = None
 current_stream_lock = asyncio.Lock()
 
@@ -1908,9 +1957,9 @@ def _realtime_session(session_id: str) -> AvatarStream:
 @app.get("/api/realtime/{session_id}/idle")
 def realtime_idle(session_id: str) -> Response:
     stream = _realtime_session(session_id)
-    if stream.idle_path is None:
+    if stream.idle_path is None or not stream.idle_path.is_file():
         raise HTTPException(status_code=404, detail="Idle video is not ready.")
-    video = read_idle_video(stream.idle_path)
+    video = stream.idle_path.read_bytes()
     logger.info("Serving idle video: avatar=%s pid=%s bytes=%s", stream.avatar, os.getpid(), len(video))
     return Response(video, media_type="video/webm", headers={"Cache-Control": "private, max-age=86400"})
 
@@ -1921,15 +1970,9 @@ def realtime_shared_idle(cache_key: str, request: Request):
     if not re.fullmatch(r"idle-inferred-[0-9a-f]{24}\.webm", cache_key):
         raise HTTPException(status_code=404, detail="Unknown idle cache key.")
     path = OUTPUTS_DIR / "realtime-cache" / cache_key
-    video = None
-    if path.is_file():
-        size = path.stat().st_size
-    else:
-        try:
-            video = read_idle_video(path)
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="Idle video is not prepared.")
-        size = len(video)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Idle video is not prepared.")
+    size = path.stat().st_size
     headers = {"Cache-Control": "public, max-age=31536000, immutable",
                "ETag": f'"{cache_key}"', "Accept-Ranges": "bytes"}
     if request.headers.get("if-none-match") == headers["ETag"]:
@@ -1960,19 +2003,15 @@ def realtime_shared_idle(cache_key: str, request: Request):
     headers["Content-Length"] = str(max(0, end - start + 1))
 
     def chunks():
-        if video is not None:
-            for offset in range(start, end + 1, 64 * 1024):
-                yield video[offset:min(offset + 64 * 1024, end + 1)]
-        else:
-            with path.open("rb") as file:
-                file.seek(start)
-                remaining = end - start + 1
-                while remaining > 0:
-                    chunk = file.read(min(64 * 1024, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
+        with path.open("rb") as file:
+            file.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = file.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
 
     return StreamingResponse(chunks(), status_code=status, media_type="video/webm", headers=headers)
 
@@ -1993,10 +2032,11 @@ def realtime_background(session_id: str, index: int) -> Response:
     return Response(base64.b64decode(encoded), media_type="image/png", headers=headers)
 
 
-async def _prepare_avatar_stream(websocket: WebSocket, avatar: str):
+async def _prepare_avatar_stream(websocket: WebSocket, avatar: str, offline_quality: bool):
     """Keep startup traffic flowing while waiting for blocking model work."""
     started = time.monotonic()
-    preparation = asyncio.create_task(asyncio.to_thread(AvatarStream, avatar, cache_silence_frames=False))
+    preparation = asyncio.create_task(asyncio.to_thread(
+        AvatarStream, avatar, offline_quality=offline_quality, cache_silence_frames=False))
     try:
         while True:
             done, _ = await asyncio.wait({preparation}, timeout=STREAM_PREPARATION_STATUS_INTERVAL)
@@ -2017,7 +2057,7 @@ async def _prepare_avatar_stream(websocket: WebSocket, avatar: str):
 
 
 @app.websocket("/ws/stream")
-async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
+async def stream_avatar(websocket: WebSocket, avatar: str, offline_quality: bool = True) -> None:
     global current_stream
 
     await websocket.accept()
@@ -2035,7 +2075,7 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
         async with current_stream_lock:
             if current_stream is not None:
                 raise RuntimeError("Another avatar stream is active. Stop it before starting a new stream.")
-            current_stream = await _prepare_avatar_stream(websocket, avatar)
+            current_stream = await _prepare_avatar_stream(websocket, avatar, offline_quality)
             stream = current_stream
         if stream.idle_path is None:
             raise RuntimeError("Inferred idle video was not prepared.")
@@ -2056,8 +2096,10 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
             {
                 "type": "status",
                 "message": (
-                    "Streaming idle avatar. Offline quality: replies play after audio_end "
-                    f"(or an audio timeout). ONNX providers: {stream.provider_summary()}"
+                    "Streaming idle avatar. "
+                    + ("Full reply mode: replies play after audio_end (or an audio timeout). "
+                       if stream.offline_quality else "Streaming mode: replies play in 320 ms chunks. ")
+                    + f"ONNX providers: {stream.provider_summary()}"
                 ),
                 "ready": True,
             }
@@ -2225,7 +2267,7 @@ async def stream_avatar(websocket: WebSocket, avatar: str) -> None:
 
 
 @app.websocket("/ws/media")
-async def stream_media(websocket: WebSocket, avatar: str) -> None:
+async def stream_media(websocket: WebSocket, avatar: str, offline_quality: bool = True) -> None:
     """Control-only WebSocket; complete video/audio travel over WebRTC."""
     global current_stream
     from gst_webrtc import BrowserIceResolver, GstTransport, ice_config, load_gstreamer
@@ -2256,7 +2298,7 @@ async def stream_media(websocket: WebSocket, avatar: str) -> None:
         async with current_stream_lock:
             if current_stream is not None:
                 raise RuntimeError("Another avatar stream is active. Stop it before starting a new stream.")
-            current_stream = await _prepare_avatar_stream(websocket, avatar)
+            current_stream = await _prepare_avatar_stream(websocket, avatar, offline_quality)
             stream = current_stream
         stream.render_batch_frames = 1
         stream.start_speech_preload()
