@@ -164,7 +164,7 @@ def main() -> None:
         try:
             log_print(f"=== FeatherTalk training pipeline: {avatar_name} ===")
 
-            log_print(f"[1/3] TBDub: {silent_video.name} -> {tbdub_output.name}")
+            log_print(f"[1/4] TBDub: {silent_video.name} -> {tbdub_output.name}")
             if not TBDUB_SCRIPT.is_file():
                 raise FileNotFoundError(f"TBDub script not found: {TBDUB_SCRIPT}")
             if not TBDUB_AUDIO.is_file():
@@ -177,14 +177,21 @@ def main() -> None:
                 env=tbdub_env,
             )
 
-            log_print(f"[2/3] Moving files to data/{avatar_name}/")
+            log_print(f"[2/4] Moving files to data/{avatar_name}/")
             shutil.move(str(tbdub_output), str(data_dir / "train.mp4"))
             shutil.move(str(silent_video), str(data_dir / "silence.mp4"))
             log_print(f"  silence.mp4 -> data/{avatar_name}/silence.mp4")
             log_print(f"  train.mp4   -> data/{avatar_name}/train.mp4")
 
-            log_print(f"[3/3] Training avatar: {avatar_name}")
+            log_print(f"[3/4] Training avatar: {avatar_name}")
             _run(["bash", "scripts/train_avatar.sh", avatar_name], cwd=ROOT_DIR, log_file=log, prefix=tag)
+
+            log_print(f"[4/4] Preparing stream cache: {avatar_name}")
+            try:
+                _run([sys.executable, "scripts/prepare_idle_cache.py", avatar_name], cwd=ROOT_DIR, log_file=log, prefix=tag)
+            except Exception as exc:
+                # The trained avatar is usable; the first stream start rebuilds a missing cache.
+                log_print(f"  WARNING: stream cache preparation failed, first start will prepare it: {exc}")
 
             log_print("=== Pipeline complete ===")
             success = True

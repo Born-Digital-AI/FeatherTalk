@@ -1881,6 +1881,12 @@ def _prepare_disk_cache(avatar: str, offline_quality: bool) -> None:
                 avatar, offline_quality, time.perf_counter() - started)
 
 
+def webrtc_video_settings(stream: AvatarStream):
+    from webrtc_media import VideoSettings
+    return VideoSettings(stream.silence_size[1], stream.silence_size[0],
+                         bitrate=int(os.environ.get("FEATHER_WEBRTC_BITRATE", "8000000")))
+
+
 current_stream: AvatarStream | None = None
 current_stream_lock = asyncio.Lock()
 
@@ -2271,7 +2277,7 @@ async def stream_media(websocket: WebSocket, avatar: str, offline_quality: bool 
     """Control-only WebSocket; complete video/audio travel over WebRTC."""
     global current_stream
     from gst_webrtc import BrowserIceResolver, GstTransport, ice_config, load_gstreamer
-    from webrtc_media import MediaSession, NvEncoder, VideoSettings, prepare_encoded_idle
+    from webrtc_media import MediaSession, NvEncoder, prepare_encoded_idle
 
     await websocket.accept()
     stream = session = cache = encoder = transport = None
@@ -2302,8 +2308,7 @@ async def stream_media(websocket: WebSocket, avatar: str, offline_quality: bool 
             stream = current_stream
         stream.render_batch_frames = 1
         stream.start_speech_preload()
-        settings = VideoSettings(stream.silence_size[1], stream.silence_size[0],
-                                 bitrate=int(os.environ.get("FEATHER_WEBRTC_BITRATE", "8000000")))
+        settings = webrtc_video_settings(stream)
         await websocket.send_json(dict(type="status", message="Preparing cached avatar video..."))
         logger.info("WebRTC startup: preparing H.264 idle cache avatar=%s size=%sx%s", avatar,
                     settings.width, settings.height)

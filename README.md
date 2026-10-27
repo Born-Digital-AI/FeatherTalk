@@ -473,7 +473,8 @@ speech. Each connection gets fresh audio buffers and a reset playback cursor.
 Once prepared, watching idle does not run inference. Offline speech quality
 remains unchanged.
 
-To prepare an avatar once before users open it, run inside the GPU container:
+The training pipeline prepares this cache for both lip-sync modes automatically.
+To prepare an avatar trained earlier, run inside the GPU container:
 
 ```bash
 docker compose exec feathertalk python scripts/prepare_idle_cache.py mousa4

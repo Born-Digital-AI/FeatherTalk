@@ -14,7 +14,8 @@ flowchart TD
     F --> F1[data_utils/process.py<br/>preprocessing]
     F1 --> F2[train.py<br/>model training]
     F2 --> F3[Promote best.pth to last.pth<br/>+ cleanup]
-    F3 --> G[Email notification]
+    F3 --> H["4. scripts/prepare_idle_cache.py<br/>(stream cache, both lip-sync modes)"]
+    H --> G[Email notification]
 ```
 
 ## Entry point: `train_pipeline.py`
@@ -39,7 +40,8 @@ In normal use you don't call it by hand. `app.py` runs a background worker that 
    - TBDub output -> `data/<avatar>/train.mp4`
    - original silent video -> `data/<avatar>/silence.mp4` (used later as the idle/silence video)
 3. **Train** – Runs `scripts/train_avatar.sh <avatar>` (see below).
-4. **Notify** – Sends an HTML email (success or failure with the error text) through SMTP. If SMTP is not configured, this step is skipped.
+4. **Prepare stream cache** – Runs `scripts/prepare_idle_cache.py <avatar>`, so the avatar is ready to stream without waiting: ONNX exports, the inferred idle WebM for both lip-sync modes and, with the WebRTC transport, their H.264 idle caches, all under `data/<avatar>/` and `outputs/realtime-cache/`. A failure here is only logged as a warning; the first stream start then prepares the missing cache. For avatars trained earlier, run it by hand: `docker compose exec feathertalk python scripts/prepare_idle_cache.py <avatar>`.
+5. **Notify** – Sends an HTML email (success or failure with the error text) through SMTP. If SMTP is not configured, this step is skipped.
 
 The complete log is written to `uploads/<avatar>_train.log`. If any step fails, the pipeline logs the error, removes the temporary TBDub output, sends the failure email and exits with code 1.
 
@@ -101,4 +103,3 @@ outputs/train_preview/ # sample predictions during training
 These are **not** called by `train_pipeline.py`, but belong to the training workflow:
 
 - `scripts/train_avatar_temporal.sh <avatar>` – Alternative manual training script. Uses `train_mouth_roi_temporal_loss.py`, which adds extra loss terms (mouth-region weighting, adjacent-frame temporal consistency, small perceptual loss). It also validates that the number of audio feature frames matches the number of video frames before training, and keeps intermediate checkpoints by default so different epochs can be compared. Hyperparameters can be overridden through environment variables (`EPOCHS`, `BATCH_SIZE`, `MOUTH_WEIGHT`, `TEMPORAL_WEIGHT`, `KEEP_ONLY_LAST`, ...).
-- `scripts/prepare_idle_cache.py <avatar>` – Optional step after training. Pre-generates the shared idle media for an avatar so the first user doesn't have to wait for it, e.g. `docker compose exec feathertalk python scripts/prepare_idle_cache.py <avatar>`.
