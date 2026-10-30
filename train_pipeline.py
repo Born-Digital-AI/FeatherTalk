@@ -149,6 +149,8 @@ def main() -> None:
     log_path = UPLOADS_DIR / f"{avatar_name}_train.log"
     tbdub_output = UPLOADS_DIR / f"{avatar_name}_tbdub_out.mp4"
     data_dir = ROOT_DIR / "data" / avatar_name
+    checkpoint_dir = ROOT_DIR / "checkpoints" / avatar_name
+    created_dirs = [path for path in (data_dir, checkpoint_dir) if not path.exists()]
     data_dir.mkdir(parents=True, exist_ok=True)
 
     error_msg = ""
@@ -201,6 +203,9 @@ def main() -> None:
             log_print(f"=== PIPELINE FAILED: {exc} ===")
             if tbdub_output.exists():
                 tbdub_output.unlink(missing_ok=True)
+            for path in created_dirs:
+                shutil.rmtree(path, ignore_errors=True)
+                log_print(f"  Removed {path.relative_to(ROOT_DIR)}")
 
     _send_email(args.email, avatar_name, app_url, success=success, error=error_msg)
 

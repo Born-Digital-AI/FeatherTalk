@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from fractions import Fraction
 import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -70,7 +71,7 @@ AVATAR_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9]*$")
 _training_queue_list: list[dict] = []  # protected by _training_state_lock
 _training_queue: queue.Queue = queue.Queue()
 _current_training: dict | None = None
-_training_state_lock = threading.Lock()
+_training_state_lock = threading.RLock()
 _training_worker_thread: threading.Thread | None = None
 
 
@@ -865,6 +866,8 @@ INDEX_HTML = """
       }
       setStreamStatus("Connecting realtime voice...");
       conversationWs = new WebSocket(wsUrl("/ws/conversation"));
+      const socket = conversationWs;
+      let microphoneError = null;
       updateRealtimeButtons();
       conversationWs.addEventListener("open", async () => {
         conversationWs.send(JSON.stringify({
@@ -873,7 +876,15 @@ INDEX_HTML = """
           avatar: streamAvatar.value,
           conversation_id: `feathertalk-${Date.now()}`
         }));
-        await startMicrophone();
+        try {
+          await startMicrophone();
+        } catch (error) {
+          stopMicrophone();
+          microphoneError = `Cannot access the microphone: ${error.message}`;
+          socket.send(JSON.stringify({ type: "stop" }));
+          socket.close();
+          return;
+        }
         updateRealtimeButtons();
         stopConversation.disabled = false;
         setStreamStatus("Conversation started.");
@@ -888,7 +899,9 @@ INDEX_HTML = """
         conversationWs = null;
         updateRealtimeButtons();
         stopConversation.disabled = true;
-        if (!streamFailed) {
+        if (microphoneError) {
+          setStreamStatus(microphoneError);
+        } else if (!streamFailed) {
           setStreamStatus(streamWs ? "Conversation stopped. Idle streaming continues." : "Conversation stopped.");
         }
       });
@@ -1105,10 +1118,18 @@ def _relative(path: Path) -> str:
     return str(path.relative_to(ROOT_DIR))
 
 
+def _training_avatars() -> set[str]:
+    """Queued and running jobs; train.py writes last.pth before training finishes."""
+    with _training_state_lock:
+        return {job["avatar"] for job in _training_queue_list}
+
+
 def list_avatars() -> list[str]:
     if not CHECKPOINTS_DIR.exists():
         return []
-    return sorted(path.name for path in CHECKPOINTS_DIR.iterdir() if path.is_dir())
+    training = _training_avatars()
+    return sorted(path.name for path in CHECKPOINTS_DIR.iterdir()
+                  if (path / "last.pth").is_file() and path.name not in training)
 
 
 def generate_video(avatar: str, uploaded_audio_path: str) -> tuple[str, Path | None]:
@@ -1918,6 +1939,8 @@ def upload_audio(audio: UploadFile = File(...)) -> dict[str, str]:
     target_path = AUDIO_DIR / filename
     with target_path.open("wb") as target_file:
         shutil.copyfileobj(audio.file, target_file)
+    # Features are cached by file name; a re-upload must not reuse the previous audio's features.
+    (AUDIO_DIR / f"{target_path.stem}_hu.npy").unlink(missing_ok=True)
 
     return {
         "audio_path": _relative(target_path),
@@ -2538,17 +2561,38 @@ def _ensure_training_worker() -> None:
             _training_worker_thread.start()
 
 
+def _avatar_name_conflict(name: str) -> str | None:
+    if (DATA_DIR / name).exists():
+        return f"Avatar '{name}' already exists."
+    if name in _training_avatars():
+        return f"Avatar '{name}' is already queued for training."
+    return None
+
+
+def _video_fps(path: Path) -> float | None:
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        text=True, capture_output=True,
+    )
+    try:
+        return float(Fraction(completed.stdout.strip()))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 @app.get("/api/check-avatar-name")
 def check_avatar_name(name: str) -> dict[str, Any]:
     if not AVATAR_NAME_RE.match(name):
         return {"available": False, "reason": "Name must start with a letter and contain only letters and numbers (no spaces)."}
-    if (DATA_DIR / name).exists():
-        return {"available": False, "reason": f"Avatar '{name}' already exists."}
+    conflict = _avatar_name_conflict(name)
+    if conflict:
+        return {"available": False, "reason": conflict}
     return {"available": True, "reason": ""}
 
 
 @app.post("/api/upload-training-video")
-async def upload_training_video(video: UploadFile = File(...)) -> dict[str, str]:
+def upload_training_video(video: UploadFile = File(...)) -> dict[str, str]:
     filename = _safe_filename(video.filename or "")
     extension = Path(filename).suffix.lower()
     if extension not in TRAINING_VIDEO_EXTENSIONS:
@@ -2560,6 +2604,11 @@ async def upload_training_video(video: UploadFile = File(...)) -> dict[str, str]
     target_path = UPLOADS_DIR / unique_name
     with target_path.open("wb") as f:
         shutil.copyfileobj(video.file, f)
+    fps = _video_fps(target_path)
+    if fps is None or abs(fps - 25) > 0.01:
+        target_path.unlink()
+        found = "could not be read" if fps is None else f"is {fps:g} FPS"
+        raise HTTPException(status_code=400, detail=f"Training video must be 25 FPS; the uploaded video {found}.")
     return {
         "video_path": _relative(target_path),
         "preview_url": f"/uploads/{unique_name}",
@@ -2643,8 +2692,6 @@ def start_training(
 ) -> dict[str, str]:
     if not AVATAR_NAME_RE.match(avatar_name):
         raise HTTPException(status_code=400, detail="Invalid avatar name.")
-    if (DATA_DIR / avatar_name).exists():
-        raise HTTPException(status_code=400, detail=f"Avatar '{avatar_name}' already exists.")
 
     resolved_video = (ROOT_DIR / video_path).resolve() if not Path(video_path).is_absolute() else Path(video_path).resolve()
     try:
@@ -2656,6 +2703,10 @@ def start_training(
 
     job = {"avatar": avatar_name, "video": str(resolved_video), "email": email}
     with _training_state_lock:
+        # Check and enqueue atomically so two submissions cannot claim the same name.
+        conflict = _avatar_name_conflict(avatar_name)
+        if conflict:
+            raise HTTPException(status_code=400, detail=conflict)
         _training_queue_list.append({"avatar": avatar_name, "email": email})
     _training_queue.put(job)
     _ensure_training_worker()
