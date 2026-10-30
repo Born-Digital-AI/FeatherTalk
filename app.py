@@ -71,6 +71,7 @@ AVATAR_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9]*$")
 _training_queue_list: list[dict] = []  # protected by _training_state_lock
 _training_queue: queue.Queue = queue.Queue()
 _current_training: dict | None = None
+_last_training: dict | None = None
 _training_state_lock = threading.RLock()
 _training_worker_thread: threading.Thread | None = None
 
@@ -373,10 +374,8 @@ INDEX_HTML = """
             Phone number
             <input id="phoneNumber" name="phoneNumber" type="tel" autocomplete="tel" placeholder="+420...">
           </label>
-          <button id="startStream" type="button" disabled>Start streaming</button>
-          <button id="stopStream" type="button" disabled>Stop stream</button>
-          <button id="startConversation" type="button" disabled>Start conversation</button>
-          <button id="stopConversation" type="button" disabled>Stop conversation</button>
+          <button id="streamButton" type="button" disabled>Start streaming</button>
+          <button id="conversationButton" type="button" disabled>Start conversation</button>
           <label>
             Realtime status
             <textarea id="streamStatus" readonly>Start streaming to show the idle avatar.</textarea>
@@ -513,10 +512,8 @@ INDEX_HTML = """
     const lipSyncMode = document.querySelector("#lipSyncMode");
     const lipSyncHint = document.querySelector("#lipSyncHint");
     const phoneNumber = document.querySelector("#phoneNumber");
-    const startStream = document.querySelector("#startStream");
-    const stopStream = document.querySelector("#stopStream");
-    const startConversation = document.querySelector("#startConversation");
-    const stopConversation = document.querySelector("#stopConversation");
+    const streamButton = document.querySelector("#streamButton");
+    const conversationButton = document.querySelector("#conversationButton");
     const streamStatus = document.querySelector("#streamStatus");
     const streamImage = document.querySelector("#streamImage");
     const idleVideo = document.querySelector("#idleVideo");
@@ -600,9 +597,12 @@ INDEX_HTML = """
 
     function updateRealtimeButtons() {
       const phoneNumberFilled = hasPhoneNumber();
-      startStream.disabled = !phoneNumberFilled || !!streamWs;
+      // Stop is offered only once the socket is open (stream) or the microphone runs (conversation).
+      streamButton.textContent = streamWs ? "Stop stream" : "Start streaming";
+      streamButton.disabled = streamWs ? streamWs.readyState !== WebSocket.OPEN : !phoneNumberFilled;
       lipSyncMode.disabled = !!streamWs;
-      startConversation.disabled = !phoneNumberFilled || !streamReady || !!conversationWs;
+      conversationButton.textContent = conversationWs ? "Stop conversation" : "Start conversation";
+      conversationButton.disabled = conversationWs ? !microphoneNode : !phoneNumberFilled || !streamReady;
     }
 
     async function loadAvatars() {
@@ -643,8 +643,7 @@ INDEX_HTML = """
     lipSyncMode.addEventListener("change", updateLipSyncHint);
     updateLipSyncHint();
 
-    startStream.addEventListener("click", () => {
-      if (streamWs) return;
+    function startStreaming() {
       clearPlayback();
       streamReady = false;
       streamFailed = false;
@@ -674,7 +673,7 @@ INDEX_HTML = """
         const mediaPlayer = realtimePlayer;
         updateRealtimeButtons();
         let signaling = Promise.resolve();
-        streamWs.addEventListener("open", () => { stopStream.disabled = false; });
+        streamWs.addEventListener("open", updateRealtimeButtons);
         streamWs.addEventListener("message", event => {
           signaling = signaling.then(async () => {
             if (streamWs !== mediaSocket || realtimePlayer !== mediaPlayer) return;
@@ -699,9 +698,8 @@ INDEX_HTML = """
           if (streamWs !== mediaSocket) return;
           streamWs = null;
           streamReady = false;
-          stopConversation.click();
+          stopConversation();
           clearPlayback();
-          stopStream.disabled = true;
           updateRealtimeButtons();
           if (!streamFailed) {
             if (streamStopRequested) { hideStageLoader(); setStreamStatus("Stream stopped."); }
@@ -745,7 +743,6 @@ INDEX_HTML = """
       updateRealtimeButtons();
       streamWs.addEventListener("open", () => {
         updateRealtimeButtons();
-        stopStream.disabled = false;
         setStreamStatus("Preparing avatar stream...");
       });
       streamWs.addEventListener("message", (event) => {
@@ -786,10 +783,8 @@ INDEX_HTML = """
         streamWs = null;
         streamReady = false;
         clearPlayback();
-        if (conversationWs) stopConversation.click();
+        stopConversation();
         updateRealtimeButtons();
-        stopStream.disabled = true;
-        stopConversation.disabled = true;
         hideStageLoader();
         if (!streamFailed) {
           if (streamStopRequested) {
@@ -800,13 +795,13 @@ INDEX_HTML = """
           }
         }
       });
-    });
+    }
 
-    stopStream.addEventListener("click", () => {
+    function stopStreaming() {
       streamStopRequested = true;
-      stopConversation.click();
-      if (streamWs) streamWs.close();
-    });
+      stopConversation();
+      streamWs.close();
+    }
 
     async function startMicrophone() {
       mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -855,7 +850,7 @@ INDEX_HTML = """
       mediaStream = null;
     }
 
-    startConversation.addEventListener("click", async () => {
+    function startConversation() {
       if (!streamWs) {
         setStreamStatus("Start streaming before starting a conversation.");
         return;
@@ -886,7 +881,6 @@ INDEX_HTML = """
           return;
         }
         updateRealtimeButtons();
-        stopConversation.disabled = false;
         setStreamStatus("Conversation started.");
       });
       conversationWs.addEventListener("message", (event) => {
@@ -898,23 +892,23 @@ INDEX_HTML = """
         stopMicrophone();
         conversationWs = null;
         updateRealtimeButtons();
-        stopConversation.disabled = true;
         if (microphoneError) {
           setStreamStatus(microphoneError);
         } else if (!streamFailed) {
           setStreamStatus(streamWs ? "Conversation stopped. Idle streaming continues." : "Conversation stopped.");
         }
       });
-    });
+    }
 
-    stopConversation.addEventListener("click", () => {
+    function stopConversation() {
       stopMicrophone();
-      if (conversationWs) {
-        conversationWs.send(JSON.stringify({ type: "stop" }));
-        conversationWs.close();
-      }
-    });
+      if (!conversationWs) return;
+      if (conversationWs.readyState === WebSocket.OPEN) conversationWs.send(JSON.stringify({ type: "stop" }));
+      conversationWs.close();
+    }
 
+    streamButton.addEventListener("click", () => (streamWs ? stopStreaming() : startStreaming()));
+    conversationButton.addEventListener("click", () => (conversationWs ? stopConversation() : startConversation()));
     phoneNumber.addEventListener("input", updateRealtimeButtons);
 
     audio.addEventListener("change", async () => {
@@ -1004,6 +998,10 @@ INDEX_HTML = """
           setTrainingStatus(msg);
         } else if (data.queue.length > 0) {
           setTrainingStatus(`${data.queue.length} job(s) queued. Starting soon...`);
+        } else if (data.last) {
+          setTrainingStatus(data.last.success
+            ? `Training '${data.last.avatar}' finished successfully.`
+            : `Training '${data.last.avatar}' failed: ${data.last.error}`);
         }
       } catch {}
     }
@@ -2525,29 +2523,50 @@ async def conversation_bridge(websocket: WebSocket) -> None:
             await websocket.close()
 
 
+def _training_failure_reason(avatar: str, returncode: int) -> str:
+    marker = "=== PIPELINE FAILED: "
+    log_path = UPLOADS_DIR / f"{avatar}_train.log"
+    with contextlib.suppress(OSError):
+        for line in reversed(log_path.read_text(errors="replace").splitlines()):
+            if line.startswith(marker):
+                return line[len(marker):].removesuffix(" ===")
+    return f"Training pipeline exited with code {returncode}."
+
+
+def _run_training_job(job: dict) -> None:
+    global _current_training, _last_training
+    error = ""
+    try:
+        with _training_state_lock:
+            _current_training = {**job, "started_at": time.time()}
+        proc = subprocess.Popen(
+            [
+                sys.executable, str(ROOT_DIR / "train_pipeline.py"),
+                "--avatar", job["avatar"],
+                "--video", job["video"],
+                "--email", job["email"],
+            ],
+        )
+        returncode = proc.wait()
+        if returncode != 0:
+            error = _training_failure_reason(job["avatar"], returncode)
+    except Exception as exc:
+        logger.exception("Training worker error: avatar=%s", job.get("avatar"))
+        error = str(exc)
+    finally:
+        with _training_state_lock:
+            _current_training = None
+            _last_training = {"avatar": job.get("avatar"), "success": not error, "error": error}
+            if _training_queue_list and _training_queue_list[0].get("avatar") == job.get("avatar"):
+                _training_queue_list.pop(0)
+
+
 def _training_worker() -> None:
-    global _current_training
     while True:
         job = _training_queue.get()
         try:
-            with _training_state_lock:
-                _current_training = {**job, "started_at": time.time()}
-            proc = subprocess.Popen(
-                [
-                    sys.executable, str(ROOT_DIR / "train_pipeline.py"),
-                    "--avatar", job["avatar"],
-                    "--video", job["video"],
-                    "--email", job["email"],
-                ],
-            )
-            proc.wait()
-        except Exception:
-            logger.exception("Training worker error: avatar=%s", job.get("avatar"))
+            _run_training_job(job)
         finally:
-            with _training_state_lock:
-                _current_training = None
-                if _training_queue_list and _training_queue_list[0].get("avatar") == job.get("avatar"):
-                    _training_queue_list.pop(0)
             _training_queue.task_done()
 
 
@@ -2681,7 +2700,8 @@ def training_status() -> dict[str, Any]:
         with _training_queue.mutex:
             queued_snapshot = list(_training_queue.queue)
         queue_info = [{"avatar": j["avatar"], "email": j["email"]} for j in queued_snapshot]
-    return {"current": current, "queue": queue_info}
+        last = dict(_last_training) if _last_training is not None else None
+    return {"current": current, "queue": queue_info, "last": last}
 
 
 @app.post("/api/train")
